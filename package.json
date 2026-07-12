@@ -1,0 +1,18 @@
+{
+  "name": "sellersprite-userscripts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Versioned ScriptCat userscripts for the SellerSprite Amazon workflow.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yuanzeli695-byte/sellersprite-userscripts.git"
+  },
+  "scripts": {
+    "test": "node tools/validate-userscripts.mjs && node tools/core-logic.test.mjs",
+    "version:integrated": "node tools/set-version.mjs integrated",
+    "version:collector": "node tools/set-version.mjs collector"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
