@@ -22,3 +22,4 @@ const updated = source
 assert.notEqual(updated, source, "version was not changed");
 await writeFile(file, updated, "utf8");
 console.log(`updated ${targets[target]} to ${version}`);
+console.log("remember to update README.md, docs/CONFIGURATION.md, and CHANGELOG.md before npm test");

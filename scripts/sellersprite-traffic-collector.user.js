@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SellerSprite Traffic Collector MVP
 // @namespace    codex.amazon.product-selection
-// @version      0.4.4
-// @description  Collect recent SellerSprite traffic data and stop as soon as the strict 70% gate fails.
+// @version      0.4.6
+// @description  Collect recent SellerSprite traffic data with guarded zero-share parsing and strict 70% short-circuiting.
 // @match        https://www.amazon.com/*
 // @match        https://amazon.com/*
 // @homepageURL  https://github.com/yuanzeli695-byte/sellersprite-userscripts
@@ -16,9 +16,53 @@
 (function () {
   "use strict";
 
-  var VERSION = "0.4.4";
+  var VERSION = "0.4.6";
   var PROTOCOL_VERSION = "1";
   var SCHEMA_VERSION = "sellerSpriteTraffic/v1";
+  var ENABLE_TIER0_TELEMETRY = true;
+  var ENABLE_TIER2_1_ZERO_SHARE_DERIVATION = true;
+  var TIER2_READER_VERSION = "tier2.1-zero-share-v1";
+  var TELEMETRY_SCHEMA_VERSION = "sellerSpriteTelemetry/v1";
+
+  var GATE_LOG_COLUMNS = [
+    "collectedAt",
+    "asin",
+    "collectorVersion",
+    "outcome",
+    "shortCircuitGate",
+    "gateA",
+    "gateB",
+    "gateC",
+    "gateD",
+    "gateE",
+    "gateF",
+    "trafficStatus",
+    "trafficDecision",
+    "weeksRead",
+    "latestNaturalSharePct",
+    "recent4AvgNaturalSharePct",
+    "recent4MinNaturalSharePct",
+    "shortCircuitReason",
+    "method",
+    "runId"
+  ];
+
+  var TIMING_LOG_COLUMNS = [
+    "startedAt",
+    "completedAt",
+    "asin",
+    "collectorVersion",
+    "detailPageMs",
+    "detailPageMsReason",
+    "trafficChartMs",
+    "priceChartMs",
+    "priceChartMsReason",
+    "chartWaitMs",
+    "tooltipScanMs",
+    "retryCount",
+    "totalMs",
+    "runId"
+  ];
 
   var labels = {
     total: "\u603b\u6d41\u91cf",
@@ -30,7 +74,8 @@
 
   var MAX_RECENT_WEEKS = 4;
   var MIN_REQUIRED_WEEKS = 3;
-  var TRAFFIC_WINDOW_LABEL = "recent 4 weeks / min 3 weeks";
+  var TRAFFIC_MIN_PCT = 70;
+  var TRAFFIC_WINDOW_LABEL = "recent " + MAX_RECENT_WEEKS + " weeks / min " + MIN_REQUIRED_WEEKS + " weeks";
 
   var state = {
     running: false,
@@ -72,6 +117,32 @@
   function parseNumber(text) {
     var match = safeText(text).match(/-?\d[\d,]*(?:\.\d+)?/);
     return match ? Number(match[0].replace(/,/g, "")) : null;
+  }
+
+  function explicitMetricValue(lines, label) {
+    var labelIndex = -1;
+    for (var i = 0; i < lines.length; i += 1) {
+      if (lines[i].indexOf(label) >= 0) {
+        labelIndex = i;
+        break;
+      }
+    }
+    if (labelIndex < 0) return { state: "missing", value: null, raw: "" };
+
+    var labelLine = lines[labelIndex];
+    var labelOffset = labelLine.indexOf(label) + label.length;
+    var candidate = labelLine.slice(labelOffset).trim();
+    if (!candidate && labelIndex + 1 < lines.length) candidate = lines[labelIndex + 1].trim();
+    if (!candidate) return { state: "missing", value: null, raw: "" };
+    if (/^(?:--|N\/?A|NA|null)(?:\b|\s|\(|$)/i.test(candidate)) {
+      return { state: "missing", value: null, raw: candidate };
+    }
+    var match = candidate.match(/^(-?\d[\d,]*(?:\.\d+)?)(?=\s|\(|$)/);
+    if (!match) return { state: "ambiguous", value: null, raw: candidate };
+    var value = Number(match[1].replace(/,/g, ""));
+    return Number.isFinite(value)
+      ? { state: "number", value: value, raw: candidate }
+      : { state: "ambiguous", value: null, raw: candidate };
   }
 
   function pct(value) {
@@ -232,16 +303,46 @@
       return null;
     }
 
-    return {
+    var totalEvidence = explicitMetricValue(lines, labels.total);
+    var naturalEvidence = explicitMetricValue(lines, labels.natural);
+    var totalTraffic = ENABLE_TIER2_1_ZERO_SHARE_DERIVATION
+      ? (totalEvidence.state === "number" ? totalEvidence.value : null)
+      : findAfter(labels.total);
+    var naturalTraffic = ENABLE_TIER2_1_ZERO_SHARE_DERIVATION
+      ? (naturalEvidence.state === "number" ? naturalEvidence.value : null)
+      : findAfter(labels.natural);
+    var naturalSharePct = shareAfter(labels.natural, labels.sp);
+    var naturalShareDerived = false;
+    if (
+      ENABLE_TIER2_1_ZERO_SHARE_DERIVATION &&
+      naturalSharePct === null &&
+      totalEvidence.state === "number" &&
+      totalEvidence.value > 0 &&
+      naturalEvidence.state === "number" &&
+      naturalEvidence.value === 0
+    ) {
+      naturalSharePct = 0;
+      naturalShareDerived = true;
+    }
+
+    var parsed = {
       week: week,
       weekSort: weekSortKey(week),
-      totalTraffic: findAfter(labels.total),
-      naturalTraffic: findAfter(labels.natural),
-      naturalSharePct: shareAfter(labels.natural, labels.sp),
+      totalTraffic: totalTraffic,
+      naturalTraffic: naturalTraffic,
+      naturalSharePct: naturalSharePct,
       spTraffic: findAfter(labels.sp),
       spSharePct: shareAfter(labels.sp, labels.sb),
       rawText: text
     };
+    if (ENABLE_TIER2_1_ZERO_SHARE_DERIVATION) {
+      parsed.naturalShareDerived = naturalShareDerived;
+      parsed.naturalShareSource = naturalShareDerived
+        ? "derived_explicit_zero_over_positive_total"
+        : (typeof naturalSharePct === "number" ? "sellersprite_explicit" : "missing");
+      parsed.tier2ReaderVersion = TIER2_READER_VERSION;
+    }
+    return parsed;
   }
 
   function fireMouseAt(x, y, fallback) {
@@ -273,7 +374,7 @@
       return (b.weekSort || 0) - (a.weekSort || 0);
     });
     var shares = [];
-    for (var i = 0; i < Math.min(4, details.length); i += 1) {
+    for (var i = 0; i < Math.min(MAX_RECENT_WEEKS, details.length); i += 1) {
       var value = details[i].naturalSharePct;
       if (typeof value === "number" && Number.isFinite(value)) shares.push(value);
     }
@@ -288,11 +389,11 @@
       }
       avg = sum / shares.length;
     }
-    var pass70 = shares.length >= MIN_REQUIRED_WEEKS && min >= 70;
+    var pass70 = shares.length >= MIN_REQUIRED_WEEKS && min >= TRAFFIC_MIN_PCT;
     var status = details.length ? "ok" : "no_data";
     var decision = "review";
-    if (status === "ok" && shares.length >= 3) decision = pass70 ? "pass" : "fail";
-    if (status === "ok" && shares.length < 3) decision = "sample_low_review";
+    if (status === "ok" && shares.length >= MIN_REQUIRED_WEEKS) decision = pass70 ? "pass" : "fail";
+    if (status === "ok" && shares.length < MIN_REQUIRED_WEEKS) decision = "sample_low_review";
     return {
       asin: getAsin(),
       status: status,
@@ -339,16 +440,109 @@
     }, runId);
   }
 
+  function latestNaturalShare(result) {
+    return result && result.latest && typeof result.latest.naturalSharePct === "number"
+      ? result.latest.naturalSharePct
+      : null;
+  }
+
+  function buildGateLogRow(result) {
+    result = result || {};
+    var passed = result.status === "ok" && result.decision === "pass" && result.pass70 === true;
+    var hardRejected = result.status === "ok" && result.decision === "fail";
+    var outcome = passed ? "pass" : (hardRejected ? "reject" : "review");
+    return {
+      collectedAt: result.collectedAt || "",
+      asin: result.asin || "",
+      collectorVersion: result.collectorVersion || VERSION,
+      outcome: outcome,
+      shortCircuitGate: hardRejected ? "C" : "",
+      gateA: "not_evaluated_in_collector",
+      gateB: "not_evaluated_in_collector",
+      gateC: passed ? "pass" : (hardRejected ? "reject" : "review"),
+      gateD: "not_evaluated_in_collector",
+      gateE: "not_evaluated_in_collector",
+      gateF: "not_evaluated_in_collector",
+      trafficStatus: result.status || "",
+      trafficDecision: result.decision || "",
+      weeksRead: typeof result.weeksRead === "number" ? result.weeksRead : null,
+      latestNaturalSharePct: latestNaturalShare(result),
+      recent4AvgNaturalSharePct:
+        typeof result.recent4AvgNaturalSharePct === "number" ? result.recent4AvgNaturalSharePct : null,
+      recent4MinNaturalSharePct:
+        typeof result.recent4MinNaturalSharePct === "number" ? result.recent4MinNaturalSharePct : null,
+      shortCircuitReason: passed
+        ? ""
+        : (result.shortCircuitReason || result.error || result.decision || result.status || ""),
+      method: result.method || "",
+      runId: result.runId || ""
+    };
+  }
+
+  function buildTimingLogRow(result, measurements) {
+    result = result || {};
+    measurements = measurements || {};
+    return {
+      startedAt: measurements.startedAt || "",
+      completedAt: measurements.completedAt || "",
+      asin: result.asin || "",
+      collectorVersion: result.collectorVersion || VERSION,
+      detailPageMs: null,
+      detailPageMsReason: "measured_by_runner",
+      trafficChartMs:
+        typeof measurements.trafficChartMs === "number" ? measurements.trafficChartMs : null,
+      priceChartMs: null,
+      priceChartMsReason: "measured_by_runner",
+      chartWaitMs: typeof measurements.chartWaitMs === "number" ? measurements.chartWaitMs : null,
+      tooltipScanMs:
+        typeof measurements.tooltipScanMs === "number" ? measurements.tooltipScanMs : null,
+      retryCount: 0,
+      totalMs: typeof measurements.totalMs === "number" ? measurements.totalMs : null,
+      runId: result.runId || ""
+    };
+  }
+
+  function tsvCell(value) {
+    if (value == null) return "";
+    var text = typeof value === "object" ? JSON.stringify(value) : String(value);
+    var clean = text.replace(/[\t\r\n]+/g, " ");
+    return /^\s*[=+\-@]/.test(clean) ? "'" + clean : clean;
+  }
+
+  function rowsToTsv(rows, columns) {
+    rows = Array.isArray(rows) ? rows : [];
+    columns = Array.isArray(columns) ? columns : [];
+    var lines = [columns.join("\t")];
+    for (var i = 0; i < rows.length; i += 1) {
+      lines.push(
+        columns.map(function (column) {
+          return tsvCell(rows[i] ? rows[i][column] : "");
+        }).join("\t")
+      );
+    }
+    return lines.join("\n");
+  }
+
+  function attachTelemetry(result, measurements) {
+    if (!ENABLE_TIER0_TELEMETRY) return result;
+    result.telemetry = {
+      schemaVersion: TELEMETRY_SCHEMA_VERSION,
+      gate: buildGateLogRow(result),
+      timing: buildTimingLogRow(result, measurements)
+    };
+    return result;
+  }
+
   function earlyTrafficFailureReason(details) {
     var ordered = (details || []).slice().sort(function (a, b) {
       return (b.weekSort || 0) - (a.weekSort || 0);
     });
     if (!ordered.length) return "";
     var latest = ordered[0].naturalSharePct;
-    if (typeof latest === "number" && Number.isFinite(latest) && latest < 70) return "traffic_latest_below_70";
+    if (typeof latest === "number" && Number.isFinite(latest) && latest < TRAFFIC_MIN_PCT) return "traffic_latest_below_70";
     for (var i = 0; i < ordered.length; i += 1) {
       var share = ordered[i].naturalSharePct;
-      if (typeof share === "number" && Number.isFinite(share) && share < 70) return "traffic_recent4_min_below_70";
+      if (typeof share === "number" && Number.isFinite(share) && share < TRAFFIC_MIN_PCT) return "traffic_recent4_min_below_70";
     }
     return "";
   }
@@ -413,11 +607,24 @@
       if (missesAfterEnough >= 16) break;
     }
 
-    return summarize(details, "tooltip_scan_recent_4_weeks");
+    return summarize(details, "tooltip_scan_recent_" + MAX_RECENT_WEEKS + "_weeks");
   }
 
   globalThis.SSTrafficCollectorCore = Object.freeze({
+    parseTip: parseTip,
+    summarize: summarize,
+    explicitMetricValue: explicitMetricValue,
     earlyTrafficFailureReason: earlyTrafficFailureReason,
+    buildGateLogRow: buildGateLogRow,
+    buildTimingLogRow: buildTimingLogRow,
+    attachTelemetry: attachTelemetry,
+    rowsToTsv: rowsToTsv,
+    gateLogColumns: GATE_LOG_COLUMNS.slice(),
+    timingLogColumns: TIMING_LOG_COLUMNS.slice(),
+    telemetryEnabled: ENABLE_TIER0_TELEMETRY,
+    tier21ZeroShareEnabled: ENABLE_TIER2_1_ZERO_SHARE_DERIVATION,
+    tier2ReaderVersion: TIER2_READER_VERSION,
+    trafficMinPct: TRAFFIC_MIN_PCT,
     maxRecentWeeks: MAX_RECENT_WEEKS,
     minRequiredWeeks: MIN_REQUIRED_WEEKS
   });
@@ -521,25 +728,52 @@
     if (state.running) return;
     options = options || {};
     var runId = nextRunId();
+    var runStartedMs = Date.now();
+    var startedAt = new Date(runStartedMs).toISOString();
+    var chartWaitMs = 0;
+    var tooltipScanMs = 0;
     state.running = true;
     clearPublishedResult(runId);
     setStatus("Collecting. Do not move mouse or switch tabs.", "#344054");
     try {
+      var chartWaitStartedMs = Date.now();
       var chart = getChartElement() || (await waitForChart(options.chartTimeoutMs || 60000));
+      chartWaitMs = Date.now() - chartWaitStartedMs;
       var result;
       if (!chart) {
         result = summarize([], "no_chart_timeout");
         result.status = "no_chart_loaded";
         result.decision = "review";
       } else {
-        result = await scanTooltip();
+        var tooltipScanStartedMs = Date.now();
+        try {
+          result = await scanTooltip();
+        } finally {
+          tooltipScanMs = Date.now() - tooltipScanStartedMs;
+        }
       }
       result = finalizeResult(result, runId);
+      attachTelemetry(result, {
+        startedAt: startedAt,
+        completedAt: new Date().toISOString(),
+        chartWaitMs: chartWaitMs,
+        tooltipScanMs: tooltipScanMs,
+        trafficChartMs: chartWaitMs + tooltipScanMs,
+        totalMs: Date.now() - runStartedMs
+      });
       publishResult(result);
       setOutput(resultText(result));
       setStatus(result.status === "ok" ? "Done: " + result.decision : "Need review: " + result.status, result.status === "ok" ? "#067647" : "#b42318");
     } catch (error) {
       var failed = collectorErrorResult(error, runId);
+      attachTelemetry(failed, {
+        startedAt: startedAt,
+        completedAt: new Date().toISOString(),
+        chartWaitMs: chartWaitMs,
+        tooltipScanMs: tooltipScanMs,
+        trafficChartMs: chartWaitMs + tooltipScanMs,
+        totalMs: Date.now() - runStartedMs
+      });
       publishResult(failed);
       setOutput(resultText(failed));
       setStatus("Error: " + (error && error.message ? error.message : error), "#b42318");
@@ -557,6 +791,18 @@
     }
     copyText(JSON.stringify(state.lastResult, null, 2));
     setStatus("JSON copied.", "#067647");
+  }
+
+  function copyTelemetryTable(kind) {
+    if (!state.lastResult || !state.lastResult.telemetry) {
+      setStatus("No telemetry result yet.", "#b42318");
+      return;
+    }
+    var isGate = kind === "gate";
+    var row = state.lastResult.telemetry[kind];
+    var columns = isGate ? GATE_LOG_COLUMNS : TIMING_LOG_COLUMNS;
+    copyText(rowsToTsv([row], columns));
+    setStatus((isGate ? "Gate" : "Timing") + " TSV copied.", "#067647");
   }
 
   function copyPanelText() {
@@ -587,6 +833,10 @@
     panel.setAttribute("data-ss-running", "0");
     panel.setAttribute("data-ss-run-id", "");
     panel.setAttribute("data-ss-result-run-id", "");
+    var telemetryButtons = ENABLE_TIER0_TELEMETRY
+      ? '<button id="ss-collector-copy-gate-tsv" type="button">Copy Gate TSV</button>' +
+        '<button id="ss-collector-copy-timing-tsv" type="button">Copy Timing TSV</button>'
+      : "";
     panel.innerHTML =
       '<div style="font-weight:700;margin-bottom:6px;">SellerSprite Traffic Collector ' + VERSION + '</div>' +
       '<div id="ss-collector-status" style="font-size:12px;color:#344054;margin-bottom:8px;">Ready.</div>' +
@@ -594,6 +844,7 @@
       '<button id="ss-collector-run" type="button">Collect Traffic</button>' +
       '<button id="ss-collector-copy-text" type="button">Copy Text</button>' +
       '<button id="ss-collector-copy-json" type="button">Copy JSON</button>' +
+      telemetryButtons +
       '<pre id="ss-collector-output" translate="no" class="notranslate"></pre>' +
       '<textarea id="ss-collector-json" translate="no" class="notranslate"></textarea>';
     document.documentElement.appendChild(panel);
@@ -605,6 +856,14 @@
     document.getElementById("ss-collector-run").addEventListener("click", collect);
     document.getElementById("ss-collector-copy-text").addEventListener("click", copyPanelText);
     document.getElementById("ss-collector-copy-json").addEventListener("click", copyJson);
+    if (ENABLE_TIER0_TELEMETRY) {
+      document.getElementById("ss-collector-copy-gate-tsv").addEventListener("click", function () {
+        copyTelemetryTable("gate");
+      });
+      document.getElementById("ss-collector-copy-timing-tsv").addEventListener("click", function () {
+        copyTelemetryTable("timing");
+      });
+    }
     setOutput(pageStatusText());
   }
 

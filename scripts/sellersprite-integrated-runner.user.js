@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SellerSprite Integrated Runner
 // @namespace    amazon-products
-// @version      0.3.4
-// @description  Reuses Traffic Collector 0.4.4 and short-circuits failed ASINs before dimensions or price collection.
+// @version      0.3.7
+// @description  Runs strict traffic, dimensions, current-price, and trend gates with history dedupe and telemetry.
 // @match        https://www.amazon.com/*
 // @homepageURL  https://github.com/yuanzeli695-byte/sellersprite-userscripts
 // @supportURL   https://github.com/yuanzeli695-byte/sellersprite-userscripts/issues
@@ -15,16 +15,52 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.3.4';
+  var VERSION = '0.3.7';
   var SCHEMA_VERSION = 'sellerSpriteIntegratedBatch/v0.3.0';
+  var COLLECTOR_PROTOCOL_VERSION = '1';
+  var COLLECTOR_SCHEMA_VERSION = 'sellerSpriteTraffic/v1';
+  var ENABLE_TIER0_TELEMETRY = true;
+  var ENABLE_TIER2_2_CONDITIONAL_RETRY = true;
+  var TIER2_RETRY_VERSION = 'tier2.2-conditional-retry-v1';
+  var TELEMETRY_SCHEMA_VERSION = 'sellerSpriteTelemetry/v1';
   var STORAGE_PREFIX = 'ssIntegratedRunner:v0.3:';
+  var TRAFFIC_MIN_PCT = 70;
+  var MIN_REQUIRED_TRAFFIC_WEEKS = 3;
+  var MAX_RECENT_TRAFFIC_WEEKS = 4;
+  var PRICE_MIN_USD = 9.9;
+  var PRICE_MAX_USD = 50;
+  var PRICE_TREND_ALLOWLIST = ['stable', 'rising'];
+  var STRICT_HISTORY_SCHEMA_VERSION = 'strictQualifiedHistory/v2';
+  var STRICT_GATE_PROFILE = [
+    'ruleset=strict-gates-v2',
+    'collector=' + COLLECTOR_SCHEMA_VERSION,
+    'traffic=' + MIN_REQUIRED_TRAFFIC_WEEKS + '-' + MAX_RECENT_TRAFFIC_WEEKS + 'x' + TRAFFIC_MIN_PCT,
+    'dimensions=any-readable-v1',
+    'price=' + PRICE_MIN_USD + '-' + PRICE_MAX_USD,
+    'trends=' + PRICE_TREND_ALLOWLIST.join(',')
+  ].join('|');
   var INDEX_KEY = STORAGE_PREFIX + 'index';
   var SELECTED_KEY = STORAGE_PREFIX + 'selected';
+  var STRICT_HISTORY_KEY = STORAGE_PREFIX + 'strict-qualified-history';
+  // Public builds start empty. Add only ASINs that your own deployment may skip.
+  var BOOTSTRAP_STRICT_QUALIFIED_ASINS = [];
   var AUTO_PARAM = 'ss-v3';
   var HASH_PARAM = 'ss-v3-hash';
   var INDEX_PARAM = 'ss-v3-index';
-  var COLLECTOR_PROTOCOL_VERSION = '1';
-  var COLLECTOR_SCHEMA_VERSION = 'sellerSpriteTraffic/v1';
+  var GATE_LOG_COLUMNS = [
+    'finishedAt', 'batchName', 'queueHash', 'asin', 'runnerVersion', 'collectorVersion', 'outcome',
+    'shortCircuitGate', 'shortCircuitStage', 'gateA', 'gateB', 'gateC', 'gateD',
+    'gateE', 'gateF', 'trafficStatus', 'weeksRead', 'latestNaturalSharePct',
+    'recent4AvgNaturalSharePct', 'recent4MinNaturalSharePct', 'dimensions',
+    'dimensionsSource', 'currentPrice', 'priceTrendClass', 'rejectionRule',
+    'rejectionReason', 'skippedSteps', 'url'
+  ];
+  var TIMING_LOG_COLUMNS = [
+    'startedAt', 'finishedAt', 'batchName', 'queueHash', 'asin', 'runnerVersion', 'collectorVersion',
+    'detailPageMs', 'detailPageMsReason', 'trafficChartMs', 'trafficChartMsReason',
+    'dimensionsMs', 'dimensionsMsReason', 'priceChartMs', 'priceChartMsReason',
+    'retryCount', 'retryDecision', 'retryReason', 'totalMs'
+  ];
 
   function oneLine(value) {
     return String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
@@ -46,6 +82,19 @@
     return Array.from(new Set(matches));
   }
 
+  function filterHistoricalQueue(queue, knownAsins) {
+    var history = knownAsins || {};
+    var accepted = [];
+    var skipped = [];
+    (queue || []).forEach(function (value) {
+      var asin = normalizeAsin(value);
+      if (!asin) return;
+      if (history[asin]) skipped.push(asin);
+      else accepted.push(asin);
+    });
+    return { queue: accepted, skipped: skipped };
+  }
+
   function parseTrafficCollector(payload, targetAsin, actualAsin) {
     payload = payload || {};
     var latest = payload.latest || {};
@@ -63,12 +112,15 @@
       decision: payload.decision || 'review',
       latestWeek: oneLine(latest.week),
       latestNaturalSharePct: latestShare,
+      latestNaturalShareDerived: latest.naturalShareDerived === true,
+      latestNaturalShareSource: oneLine(latest.naturalShareSource || ''),
       recent4AvgNaturalSharePct: avg,
       recent4MinNaturalSharePct: min,
       weeksRead: weeks,
-      trafficWindow: payload.trafficWindow || 'recent 4 weeks / min 3 weeks',
+      trafficWindow: payload.trafficWindow || 'recent ' + MAX_RECENT_TRAFFIC_WEEKS + ' weeks / min ' + MIN_REQUIRED_TRAFFIC_WEEKS + ' weeks',
       pass70: payload.pass70 === true,
-      method: payload.method || 'collector_0.4.4',
+      collectorTelemetry: payload.telemetry || null,
+      method: payload.method || 'collector_0.4.6',
       collectedAt: payload.collectedAt || new Date().toISOString(),
       note: payload.status === 'ok' ? oneLine(payload.decision || 'ok') : oneLine(payload.status || 'error')
     };
@@ -77,7 +129,6 @@
   function evaluateTrafficGate(traffic, asinMismatch) {
     if (asinMismatch) return { pass: false, stage: 'asin', rule: 'asin_mismatch', reason: 'amazon_variant_redirect' };
     if (!traffic || traffic.status !== 'ok') return { pass: false, stage: 'traffic', rule: 'traffic_error', reason: oneLine((traffic || {}).note || (traffic || {}).status || 'missing_traffic') };
-    if (Number(traffic.weeksRead || 0) < 3) return { pass: false, stage: 'traffic', rule: 'traffic_weeks_insufficient', reason: 'weeksRead < 3' };
     var checks = [
       ['traffic_latest_below_70', traffic.latestNaturalSharePct],
       ['traffic_recent4_avg_below_70', traffic.recent4AvgNaturalSharePct],
@@ -85,8 +136,11 @@
     ];
     for (var i = 0; i < checks.length; i += 1) {
       var value = checks[i][1];
-      if (!Number.isFinite(value)) return { pass: false, stage: 'traffic', rule: 'traffic_metric_missing', reason: checks[i][0] + ' missing' };
-      if (value < 70) return { pass: false, stage: 'traffic', rule: checks[i][0], reason: value.toFixed(2) + '% < 70%' };
+      if (Number.isFinite(value) && value < TRAFFIC_MIN_PCT) return { pass: false, stage: 'traffic', rule: checks[i][0], reason: value.toFixed(2) + '% < ' + TRAFFIC_MIN_PCT + '%' };
+    }
+    if (Number(traffic.weeksRead || 0) < MIN_REQUIRED_TRAFFIC_WEEKS) return { pass: false, stage: 'traffic', rule: 'traffic_weeks_insufficient', reason: 'weeksRead < ' + MIN_REQUIRED_TRAFFIC_WEEKS };
+    for (var j = 0; j < checks.length; j += 1) {
+      if (!Number.isFinite(checks[j][1])) return { pass: false, stage: 'traffic', rule: 'traffic_metric_missing', reason: checks[j][0] + ' missing' };
     }
     if (traffic.pass70 !== true || traffic.decision !== 'pass') {
       return { pass: false, stage: 'traffic', rule: 'traffic_collector_not_pass', reason: 'decision=' + oneLine(traffic.decision || 'missing') + '; pass70=' + String(traffic.pass70 === true) };
@@ -100,9 +154,34 @@
     var avg = numberOrNull(payload.recent4AvgNaturalSharePct);
     var min = numberOrNull(payload.recent4MinNaturalSharePct);
     return payload.shortCircuited === true
-      || (Number.isFinite(latest) && latest < 70)
-      || (Number.isFinite(avg) && avg < 70)
-      || (Number.isFinite(min) && min < 70);
+      || (Number.isFinite(latest) && latest < TRAFFIC_MIN_PCT)
+      || (Number.isFinite(avg) && avg < TRAFFIC_MIN_PCT)
+      || (Number.isFinite(min) && min < TRAFFIC_MIN_PCT);
+  }
+
+  function legacyCollectorRetryReason(payload) {
+    payload = payload || {};
+    if (collectorHasKnownTrafficFailure(payload)) return '';
+    return payload.status !== 'ok' || Number(payload.weeksRead || 0) < MIN_REQUIRED_TRAFFIC_WEEKS
+      ? 'legacy_incomplete_traffic'
+      : '';
+  }
+
+  function collectorRetryReason(payload) {
+    payload = payload || {};
+    if (collectorHasKnownTrafficFailure(payload)) return '';
+    if (payload.retryable === true) return oneLine(payload.retryReason || 'collector_not_ready');
+    if (payload.status === 'no_chart_loaded') return 'chart_not_ready';
+    if (payload.status === 'no_data' && (!Array.isArray(payload.details) || payload.details.length === 0)) {
+      return 'tooltip_not_ready';
+    }
+    return '';
+  }
+
+  function shouldRetryCollector(payload) {
+    return Boolean(ENABLE_TIER2_2_CONDITIONAL_RETRY
+      ? collectorRetryReason(payload)
+      : legacyCollectorRetryReason(payload));
   }
 
   function evaluateDimensionsGate(dimensions) {
@@ -111,19 +190,40 @@
       : { pass: false, stage: 'dimensions', rule: 'dimensions_missing', reason: 'dimensions missing' };
   }
 
-  function evaluatePriceGate(priceTrendClass) {
+  function currentPriceFromSamples(samples) {
+    var clean = normalizePriceSamples(samples);
+    return clean.length ? clean[clean.length - 1].price : null;
+  }
+
+  function evaluatePriceGate(priceTrendClass, currentPrice) {
     var value = oneLine(priceTrendClass).toLowerCase();
-    return ['stable', 'rising'].indexOf(value) >= 0
+    var price = Number(currentPrice);
+    if (!Number.isFinite(price) || price <= 0) {
+      return { pass: false, stage: 'price', rule: 'price_current_missing', reason: 'current price missing' };
+    }
+    if (price < PRICE_MIN_USD || price > PRICE_MAX_USD) {
+      return {
+        pass: false,
+        stage: 'price',
+        rule: 'price_current_out_of_range',
+        reason: usd(price) + ' outside $' + PRICE_MIN_USD.toFixed(2) + '-$' + PRICE_MAX_USD.toFixed(2)
+      };
+    }
+    return PRICE_TREND_ALLOWLIST.indexOf(value) >= 0
       ? { pass: true, stage: 'price', rule: 'price_trend_pass', reason: value }
       : { pass: false, stage: 'price', rule: 'price_trend_not_allowed', reason: value || 'no_data' };
   }
 
   function isQualifiedResult(result) {
     if (!result) return false;
-    if (result.strictDecision) return result.strictDecision === 'pass';
+    if (result.strictDecision === 'reject') return false;
+    var explicitPrice = Number(result.currentPrice);
+    var currentPrice = result.currentPrice != null && result.currentPrice !== '' && Number.isFinite(explicitPrice) && explicitPrice > 0
+      ? explicitPrice
+      : currentPriceFromSamples(result.priceSamples);
     return evaluateTrafficGate(result, Boolean(result.asinMismatch)).pass
       && evaluateDimensionsGate(result.dimensions).pass
-      && evaluatePriceGate(result.priceTrendClass).pass;
+      && evaluatePriceGate(result.priceTrendClass, currentPrice).pass;
   }
 
   function applyStepUpdate(state, step, message) {
@@ -137,6 +237,176 @@
     var completed = (results || []).filter(Boolean).length;
     var qualified = (results || []).filter(isQualifiedResult).length;
     return { completed: completed, qualified: qualified, rejected: completed - qualified };
+  }
+
+  function gateCodeForStage(stage) {
+    return { traffic: 'C', dimensions: 'D', price: 'E' }[oneLine(stage)] || '';
+  }
+
+  function buildRunnerGateLogRow(result, context) {
+    result = result || {};
+    context = context || {};
+    var passed = result.strictDecision === 'pass';
+    var stage = passed ? '' : oneLine(result.rejectionStage);
+    var gateC = 'not_run';
+    var gateD = 'not_run';
+    var gateE = 'not_run';
+    if (passed) {
+      gateC = 'pass';
+      gateD = 'pass';
+      gateE = 'pass';
+    } else if (stage === 'traffic') {
+      gateC = 'reject';
+    } else if (stage === 'dimensions') {
+      gateC = 'pass';
+      gateD = 'reject';
+    } else if (stage === 'price') {
+      gateC = 'pass';
+      gateD = 'pass';
+      gateE = 'reject';
+    }
+    return {
+      finishedAt: result.finishedAt || '',
+      batchName: context.batchName || '',
+      queueHash: context.queueHash || '',
+      asin: result.targetAsin || result.asin || '',
+      runnerVersion: VERSION,
+      collectorVersion: result.collectorVersion || '',
+      outcome: passed ? 'pass' : 'reject',
+      shortCircuitGate: gateCodeForStage(stage),
+      shortCircuitStage: stage,
+      gateA: 'not_evaluated_in_runner',
+      gateB: 'not_evaluated_in_runner',
+      gateC: gateC,
+      gateD: gateD,
+      gateE: gateE,
+      gateF: 'not_evaluated_in_runner',
+      trafficStatus: result.status || '',
+      weeksRead: typeof result.weeksRead === 'number' ? result.weeksRead : null,
+      latestNaturalSharePct:
+        typeof result.latestNaturalSharePct === 'number' ? result.latestNaturalSharePct : null,
+      recent4AvgNaturalSharePct:
+        typeof result.recent4AvgNaturalSharePct === 'number' ? result.recent4AvgNaturalSharePct : null,
+      recent4MinNaturalSharePct:
+        typeof result.recent4MinNaturalSharePct === 'number' ? result.recent4MinNaturalSharePct : null,
+      dimensions: result.dimensions || '',
+      dimensionsSource: result.dimensionsSource || '',
+      currentPrice: typeof result.currentPrice === 'number' ? result.currentPrice : null,
+      priceTrendClass: result.priceTrendClass || '',
+      rejectionRule: result.rejectionRule || '',
+      rejectionReason: result.rejectionReason || '',
+      skippedSteps: Array.isArray(result.skippedSteps) ? result.skippedSteps.join(',') : '',
+      url: result.url || ''
+    };
+  }
+
+  function buildHistorySkipGateLogRow(asin, context) {
+    context = context || {};
+    return {
+      finishedAt: context.generatedAt || '',
+      batchName: context.batchName || '',
+      queueHash: context.queueHash || '',
+      asin: normalizeAsin(asin),
+      runnerVersion: VERSION,
+      collectorVersion: '',
+      outcome: 'skip',
+      shortCircuitGate: '',
+      shortCircuitStage: 'history',
+      gateA: 'not_run_history_skip',
+      gateB: 'not_run_history_skip',
+      gateC: 'not_run_history_skip',
+      gateD: 'not_run_history_skip',
+      gateE: 'not_run_history_skip',
+      gateF: 'not_run_history_skip',
+      trafficStatus: '',
+      weeksRead: null,
+      latestNaturalSharePct: null,
+      recent4AvgNaturalSharePct: null,
+      recent4MinNaturalSharePct: null,
+      dimensions: '',
+      dimensionsSource: '',
+      currentPrice: null,
+      priceTrendClass: '',
+      rejectionRule: 'strict_qualified_history_hit',
+      rejectionReason: 'historical strict-qualified ASIN skipped; cache did not pass it',
+      skippedSteps: 'traffic,dimensions,price',
+      url: ''
+    };
+  }
+
+  function measurementReason(value, configuredReason) {
+    return typeof value === 'number' && Number.isFinite(value) ? '' : (configuredReason || 'not_measured');
+  }
+
+  function buildRunnerTimingLogRow(result, measurements, context) {
+    result = result || {};
+    measurements = measurements || {};
+    context = context || {};
+    return {
+      startedAt: result.startedAt || measurements.startedAt || '',
+      finishedAt: result.finishedAt || measurements.finishedAt || '',
+      batchName: context.batchName || '',
+      queueHash: context.queueHash || '',
+      asin: result.targetAsin || result.asin || '',
+      runnerVersion: VERSION,
+      collectorVersion: result.collectorVersion || '',
+      detailPageMs: typeof measurements.detailPageMs === 'number' ? measurements.detailPageMs : null,
+      detailPageMsReason: measurementReason(measurements.detailPageMs, measurements.detailPageMsReason),
+      trafficChartMs: typeof measurements.trafficChartMs === 'number' ? measurements.trafficChartMs : null,
+      trafficChartMsReason: measurementReason(measurements.trafficChartMs, measurements.trafficChartMsReason),
+      dimensionsMs: typeof measurements.dimensionsMs === 'number' ? measurements.dimensionsMs : null,
+      dimensionsMsReason: measurementReason(measurements.dimensionsMs, measurements.dimensionsMsReason),
+      priceChartMs: typeof measurements.priceChartMs === 'number' ? measurements.priceChartMs : null,
+      priceChartMsReason: measurementReason(measurements.priceChartMs, measurements.priceChartMsReason),
+      retryCount: Number.isInteger(measurements.retryCount) ? measurements.retryCount : 0,
+      retryDecision: measurements.retryDecision || '',
+      retryReason: measurements.retryReason || '',
+      totalMs: typeof measurements.totalMs === 'number' ? measurements.totalMs : null
+    };
+  }
+
+  function buildHistorySkipTimingLogRow(asin, context) {
+    return buildRunnerTimingLogRow(
+      { asin: normalizeAsin(asin), startedAt: '', finishedAt: (context || {}).generatedAt || '' },
+      {
+        detailPageMsReason: 'history_skip_no_browser_visit',
+        trafficChartMsReason: 'history_skip_no_browser_visit',
+        dimensionsMsReason: 'history_skip_no_browser_visit',
+        priceChartMsReason: 'history_skip_no_browser_visit',
+        retryCount: 0,
+        retryDecision: 'not_run_history_skip',
+        retryReason: 'history_skip_no_browser_visit',
+        totalMs: 0
+      },
+      context
+    );
+  }
+
+  function tsvCell(value) {
+    if (value == null) return '';
+    var text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    var clean = text.replace(/[\t\r\n]+/g, ' ');
+    return /^\s*[=+\-@]/.test(clean) ? "'" + clean : clean;
+  }
+
+  function rowsToTsv(rows, columns) {
+    rows = Array.isArray(rows) ? rows : [];
+    columns = Array.isArray(columns) ? columns : [];
+    var lines = [columns.join('\t')];
+    rows.forEach(function (row) {
+      lines.push(columns.map(function (column) { return tsvCell(row ? row[column] : ''); }).join('\t'));
+    });
+    return lines.join('\n');
+  }
+
+  function attachRunnerTelemetry(result, measurements, context) {
+    if (!ENABLE_TIER0_TELEMETRY) return result;
+    result.telemetry = {
+      schemaVersion: TELEMETRY_SCHEMA_VERSION,
+      gate: buildRunnerGateLogRow(result, context),
+      timing: buildRunnerTimingLogRow(result, measurements, context)
+    };
+    return result;
   }
 
   function parsePriceTooltip(text) {
@@ -218,6 +488,9 @@
         priceTrendClass: 'no_data',
         priceTrendWindow: '近1个月',
         priceTrendSource: 'SellerSprite Keepa插件替代图',
+        currentPrice: null,
+        priceMin: null,
+        priceMax: null,
         priceSamples: []
       };
     }
@@ -237,6 +510,9 @@
       priceTrendClass: priceTrendClass,
       priceTrendWindow: '近1个月',
       priceTrendSource: 'SellerSprite Keepa插件替代图',
+      currentPrice: current,
+      priceMin: minimum,
+      priceMax: maximum,
       priceSamples: clean
     };
   }
@@ -272,12 +548,39 @@
     parseTrafficCollector: parseTrafficCollector,
     evaluateTrafficGate: evaluateTrafficGate,
     collectorHasKnownTrafficFailure: collectorHasKnownTrafficFailure,
+    legacyCollectorRetryReason: legacyCollectorRetryReason,
+    collectorRetryReason: collectorRetryReason,
+    shouldRetryCollector: shouldRetryCollector,
     evaluateDimensionsGate: evaluateDimensionsGate,
     evaluatePriceGate: evaluatePriceGate,
+    currentPriceFromSamples: currentPriceFromSamples,
     isQualifiedResult: isQualifiedResult,
     applyStepUpdate: applyStepUpdate,
     summarizeResults: summarizeResults,
+    buildRunnerGateLogRow: buildRunnerGateLogRow,
+    buildHistorySkipGateLogRow: buildHistorySkipGateLogRow,
+    buildRunnerTimingLogRow: buildRunnerTimingLogRow,
+    buildHistorySkipTimingLogRow: buildHistorySkipTimingLogRow,
+    attachRunnerTelemetry: attachRunnerTelemetry,
+    rowsToTsv: rowsToTsv,
+    gateLogColumns: GATE_LOG_COLUMNS.slice(),
+    timingLogColumns: TIMING_LOG_COLUMNS.slice(),
+    telemetryEnabled: ENABLE_TIER0_TELEMETRY,
+    trafficMinPct: TRAFFIC_MIN_PCT,
+    minRequiredTrafficWeeks: MIN_REQUIRED_TRAFFIC_WEEKS,
+    maxRecentTrafficWeeks: MAX_RECENT_TRAFFIC_WEEKS,
+    priceMinUsd: PRICE_MIN_USD,
+    priceMaxUsd: PRICE_MAX_USD,
+    priceTrendAllowlist: PRICE_TREND_ALLOWLIST.slice(),
+    tier22ConditionalRetryEnabled: ENABLE_TIER2_2_CONDITIONAL_RETRY,
+    tier2RetryVersion: TIER2_RETRY_VERSION,
+    maxCollectorRetries: 1,
+    strictHistorySchemaVersion: STRICT_HISTORY_SCHEMA_VERSION,
+    strictGateProfile: STRICT_GATE_PROFILE,
+    bootstrapStrictQualifiedAsins: BOOTSTRAP_STRICT_QUALIFIED_ASINS.slice(),
+    normalizeStrictHistory: normalizeStrictHistory,
     uniqueAsins: uniqueAsins,
+    filterHistoricalQueue: filterHistoricalQueue,
     valueAfterLabel: valueAfterLabel
   });
 
@@ -353,6 +656,67 @@
     localStorage.setItem(key, JSON.stringify(value));
   }
 
+  function normalizeStrictHistory(history) {
+    var changed = false;
+    if (!history
+      || typeof history !== 'object'
+      || Array.isArray(history)
+      || history.schemaVersion !== STRICT_HISTORY_SCHEMA_VERSION
+      || history.gateProfile !== STRICT_GATE_PROFILE) {
+      history = { schemaVersion: STRICT_HISTORY_SCHEMA_VERSION, gateProfile: STRICT_GATE_PROFILE, asins: {} };
+      changed = true;
+    }
+    if (!history.asins || typeof history.asins !== 'object' || Array.isArray(history.asins)) {
+      history.asins = {};
+      changed = true;
+    }
+    BOOTSTRAP_STRICT_QUALIFIED_ASINS.forEach(function (asin) {
+      var normalized = normalizeAsin(asin);
+      if (!normalized || history.asins[normalized]) return;
+      history.asins[normalized] = {
+        qualifiedAt: 'preloaded',
+        source: 'preloaded_deliveries',
+        gateProfile: STRICT_GATE_PROFILE
+      };
+      changed = true;
+    });
+    return { history: history, changed: changed };
+  }
+
+  function getStrictHistory() {
+    var normalized = normalizeStrictHistory(readJson(STRICT_HISTORY_KEY, null));
+    var history = normalized.history;
+    var changed = normalized.changed;
+    if (changed) {
+      history.updatedAt = new Date().toISOString();
+      writeJson(STRICT_HISTORY_KEY, history);
+    }
+    return history;
+  }
+
+  function strictHistoryCount(history) {
+    return Object.keys((history || {}).asins || {}).length;
+  }
+
+  function recordStrictQualified(asin, metadata) {
+    metadata = metadata || {};
+    var normalized = normalizeAsin(asin);
+    var history = getStrictHistory();
+    if (!normalized) return history;
+    var previous = history.asins[normalized] || {};
+    history.asins[normalized] = {
+      qualifiedAt: previous.qualifiedAt || metadata.qualifiedAt || new Date().toISOString(),
+      lastQualifiedAt: metadata.qualifiedAt || new Date().toISOString(),
+      source: previous.source || 'integrated_runner',
+      batchName: metadata.batchName || previous.batchName || '',
+      queueHash: metadata.queueHash || previous.queueHash || '',
+      gateProfile: STRICT_GATE_PROFILE
+    };
+    history.updatedAt = new Date().toISOString();
+    writeJson(STRICT_HISTORY_KEY, history);
+    return history;
+  }
+
   function getBatchIndex() {
     return readJson(INDEX_KEY, []);
   }
@@ -362,6 +726,8 @@
     state.targetQualified = Number.isInteger(Number(state.targetQualified)) && Number(state.targetQualified) > 0 ? Number(state.targetQualified) : 20;
     state.qualifiedCount = summary.qualified;
     state.rejectedCount = summary.rejected;
+    state.historySkippedCount = (state.historySkippedAsins || []).length;
+    state.historyGateProfile = STRICT_GATE_PROFILE;
     state.updatedAt = new Date().toISOString();
     writeJson(stateKey(state.queueHash), state);
     var index = getBatchIndex().filter(function (item) { return item.queueHash !== state.queueHash; });
@@ -388,8 +754,29 @@
     return localStorage.getItem(SELECTED_KEY) || '';
   }
 
+  function gateLogRows(state) {
+    var rows = (state.results || []).filter(Boolean).map(function (result) {
+      return buildRunnerGateLogRow(result, state);
+    });
+    (state.historySkippedAsins || []).forEach(function (asin) {
+      rows.push(buildHistorySkipGateLogRow(asin, state));
+    });
+    return rows;
+  }
+
+  function timingLogRows(state) {
+    var rows = (state.results || []).filter(Boolean).map(function (result) {
+      var measurements = result.telemetry && result.telemetry.timing ? result.telemetry.timing : {};
+      return buildRunnerTimingLogRow(result, measurements, state);
+    });
+    (state.historySkippedAsins || []).forEach(function (asin) {
+      rows.push(buildHistorySkipTimingLogRow(asin, state));
+    });
+    return rows;
+  }
+
   function exportBatch(state) {
-    return {
+    var exported = {
       schemaVersion: SCHEMA_VERSION,
       batchName: state.batchName,
       operator: state.operator,
@@ -401,11 +788,23 @@
       targetQualified: state.targetQualified,
       qualifiedCount: state.qualifiedCount,
       rejectedCount: state.rejectedCount,
+      historySkippedAsins: state.historySkippedAsins || [],
+      historySkippedCount: (state.historySkippedAsins || []).length,
+      historyRegistryCount: state.historyRegistryCount || 0,
+      historyGateProfile: state.historyGateProfile || STRICT_GATE_PROFILE,
       stoppedReason: state.stoppedReason || '',
       results: state.results.filter(Boolean),
       createdAt: state.createdAt,
       updatedAt: state.updatedAt
     };
+    if (ENABLE_TIER0_TELEMETRY) {
+      exported.telemetry = {
+        schemaVersion: TELEMETRY_SCHEMA_VERSION,
+        gateRows: gateLogRows(state),
+        timingRows: timingLogRows(state)
+      };
+    }
+    return exported;
   }
 
   function enrichmentOnly(state) {
@@ -463,6 +862,10 @@
     var panel = document.createElement('div');
     panel.id = 'ss-v3-panel';
     panel.className = 'notranslate';
+    var telemetryButtons = ENABLE_TIER0_TELEMETRY
+      ? '<button id="ss-v3-copy-gate-tsv">Copy gate log TSV</button>' +
+        '<button id="ss-v3-copy-timing-tsv">Copy timing log TSV</button>'
+      : '';
     panel.innerHTML = [
       '<h3>SellerSprite Integrated Runner ' + VERSION + ' <button id="ss-v3-toggle">收起</button></h3>',
       '<div class="ss-v3-body">',
@@ -477,6 +880,7 @@
       '<button id="ss-v3-resume">Resume</button>',
       '<button id="ss-v3-copy">Copy combined JSON</button>',
       '<button id="ss-v3-copy-enrichment">Copy enrichment JSON</button>',
+      telemetryButtons,
       '<button id="ss-v3-clear">Clear batch</button>',
       '<pre id="ss-v3-status">No batch selected.</pre>',
       '<textarea id="ss-v3-output" readonly></textarea>',
@@ -498,6 +902,10 @@
     panel.querySelector('#ss-v3-resume').addEventListener('click', resumeSelectedBatch);
     panel.querySelector('#ss-v3-copy').addEventListener('click', function () { copySelected(false); });
     panel.querySelector('#ss-v3-copy-enrichment').addEventListener('click', function () { copySelected(true); });
+    if (ENABLE_TIER0_TELEMETRY) {
+      panel.querySelector('#ss-v3-copy-gate-tsv').addEventListener('click', function () { copyTelemetry('gate'); });
+      panel.querySelector('#ss-v3-copy-timing-tsv').addEventListener('click', function () { copyTelemetry('timing'); });
+    }
     panel.querySelector('#ss-v3-clear').addEventListener('click', clearSelectedBatch);
     renderPanel();
   }
@@ -505,6 +913,8 @@
   function renderPanel() {
     var panel = document.querySelector('#ss-v3-panel');
     if (!panel) return;
+    var history = getStrictHistory();
+    var historyCount = strictHistoryCount(history);
     var picker = panel.querySelector('#ss-v3-picker');
     var selected = selectedHash();
     var index = getBatchIndex();
@@ -522,7 +932,7 @@
     picker.value = selected;
     var state = loadBatch(selected);
     if (!state) {
-      panel.querySelector('#ss-v3-status').textContent = 'No batch selected.';
+      panel.querySelector('#ss-v3-status').textContent = 'No batch selected.\nHistorical strict-qualified ASINs: ' + historyCount + ' (auto-skip).';
       panel.querySelector('#ss-v3-output').value = '';
       return;
     }
@@ -538,6 +948,8 @@
       'Progress: ' + summary.completed + '/' + state.queue.length,
       'Qualified: ' + summary.qualified + '/' + (state.targetQualified || 20),
       'Rejected: ' + summary.rejected,
+      'History auto-skipped: ' + (state.historySkippedAsins || []).length,
+      'Local strict-qualified history: ' + historyCount,
       'Current row: ' + (state.currentIndex + 1),
       'Current ASIN: ' + (state.queue[state.currentIndex] || ''),
       'Step: ' + (state.currentStep || 'idle'),
@@ -547,9 +959,16 @@
   }
 
   function generateBatchFromPanel() {
-    var queue = uniqueAsins(document.querySelector('#ss-v3-queue').value);
-    if (!queue.length) {
+    var inputQueue = uniqueAsins(document.querySelector('#ss-v3-queue').value);
+    if (!inputQueue.length) {
       setPanelMessage('QUEUE 中没有有效 ASIN。');
+      return;
+    }
+    var history = getStrictHistory();
+    var filtered = filterHistoricalQueue(inputQueue, history.asins);
+    var queue = filtered.queue;
+    if (!queue.length) {
+      setPanelMessage('QUEUE 中 ' + inputQueue.length + ' 个 ASIN 均已严格合格，已全部直接跳过。');
       return;
     }
     var batchName = oneLine(document.querySelector('#ss-v3-name').value) || ('integrated-' + Date.now());
@@ -570,6 +989,8 @@
       targetQualified: targetQualified,
       qualifiedCount: 0,
       rejectedCount: 0,
+      historySkippedAsins: filtered.skipped,
+      historyRegistryCount: strictHistoryCount(history),
       stoppedReason: '',
       currentStep: 'idle',
       message: '',
@@ -578,7 +999,7 @@
       updatedAt: now
     };
     saveBatch(state);
-    setPanelMessage('已生成 ' + queue.length + ' 个 ASIN。');
+    setPanelMessage('已生成 ' + queue.length + ' 个 ASIN；历史严格合格直接跳过 ' + filtered.skipped.length + ' 个。');
   }
 
   function firstMissingIndex(state) {
@@ -608,6 +1029,7 @@
     state.currentIndex = index;
     state.currentStep = 'navigate';
     state.message = 'Opening ' + state.queue[index];
+    if (ENABLE_TIER0_TELEMETRY) state.currentNavigationStartedAtMs = Date.now();
     saveBatch(state);
     var url = new URL('https://www.amazon.com/dp/' + state.queue[index]);
     url.searchParams.set('th', '1');
@@ -654,6 +1076,18 @@
     await copyText(text);
     document.querySelector('#ss-v3-output').value = text;
     setPanelMessage(enrichment ? '已复制 enrichment JSON。' : '已复制合并 JSON。');
+  }
+
+  async function copyTelemetry(kind) {
+    var state = loadBatch(selectedHash());
+    if (!state) return setPanelMessage('No batch available for telemetry export.');
+    var isGate = kind === 'gate';
+    var rows = isGate ? gateLogRows(state) : timingLogRows(state);
+    var columns = isGate ? GATE_LOG_COLUMNS : TIMING_LOG_COLUMNS;
+    var text = rowsToTsv(rows, columns);
+    await copyText(text);
+    document.querySelector('#ss-v3-output').value = text;
+    setPanelMessage((isGate ? 'Gate' : 'Timing') + ' telemetry TSV copied.');
   }
 
   function clearSelectedBatch() {
@@ -779,8 +1213,10 @@
     var panel = document.querySelector('#ss-collector-panel');
     var button = document.querySelector('#ss-collector-run');
     var output = document.querySelector('#ss-collector-json');
-    if (!panel || panel.getAttribute('data-ss-protocol-version') !== COLLECTOR_PROTOCOL_VERSION) {
-      throw new Error('Traffic Collector protocol mismatch; install Collector 0.4.4 or newer.');
+    if (!panel
+      || panel.getAttribute('data-ss-protocol-version') !== COLLECTOR_PROTOCOL_VERSION
+      || panel.getAttribute('data-ss-schema-version') !== COLLECTOR_SCHEMA_VERSION) {
+      throw new Error('Traffic Collector protocol mismatch; install Collector 0.4.6 or newer.');
     }
     await waitFor(function () {
       return panel.getAttribute('data-ss-running') !== '1';
@@ -801,9 +1237,23 @@
     return payload;
   }
 
-  async function collectTraffic() {
+  async function collectTraffic(telemetry) {
+    if (telemetry) {
+      telemetry.retryCount = 0;
+      telemetry.retryDecision = 'no_retry';
+      telemetry.retryReason = '';
+    }
     var payload = await runCollectorOnce();
-    if ((payload.status !== 'ok' || Number(payload.weeksRead || 0) < 3) && !collectorHasKnownTrafficFailure(payload)) {
+    var retryReason = ENABLE_TIER2_2_CONDITIONAL_RETRY
+      ? collectorRetryReason(payload)
+      : legacyCollectorRetryReason(payload);
+    var shouldRetry = shouldRetryCollector(payload);
+    if (telemetry) {
+      telemetry.retryReason = retryReason || (collectorHasKnownTrafficFailure(payload) ? 'known_traffic_failure' : 'not_ready_not_confirmed');
+      telemetry.retryDecision = shouldRetry ? 'retry' : 'no_retry';
+    }
+    if (shouldRetry) {
+      if (telemetry) telemetry.retryCount += 1;
       await sleep(600);
       var retry = await runCollectorOnce();
       if (retry.status === 'ok' && Number(retry.weeksRead || 0) >= Number(payload.weeksRead || 0)) payload = retry;
@@ -830,7 +1280,16 @@
     var targetAsin = state.queue[index];
     var actualAsin = currentAsin();
     var mismatch = Boolean(actualAsin && targetAsin !== actualAsin);
+    var processStartedMs = Date.now();
     var startedAt = new Date().toISOString();
+    var navigationStartedAtMs = Number(state.currentNavigationStartedAtMs);
+    var detailPageMs = ENABLE_TIER0_TELEMETRY && Number.isFinite(navigationStartedAtMs)
+      ? Math.max(0, processStartedMs - navigationStartedAtMs)
+      : null;
+    var trafficChartMs = null;
+    var dimensionsMs = null;
+    var priceChartMs = null;
+    var trafficTiming = { retryCount: 0, retryDecision: 'no_retry', retryReason: '' };
     var dimensions = { dimensions: '', itemDimensions: '', itemWeight: '', packageDimensions: '', packageWeight: '', dimensionsSource: '' };
     var priceTrend = buildPriceTrend([]);
     var collectorPayload = { status: 'error', decision: 'review', weeksRead: 0, collectedAt: new Date().toISOString() };
@@ -840,8 +1299,13 @@
 
     try {
       if (!mismatch) {
-        updateCurrentStep(state, 'traffic', 'Running Traffic Collector 0.4.4.');
-        collectorPayload = await collectTraffic();
+        updateCurrentStep(state, 'traffic', 'Running Traffic Collector 0.4.6.');
+        var trafficStartedMs = ENABLE_TIER0_TELEMETRY ? Date.now() : null;
+        try {
+          collectorPayload = await collectTraffic(ENABLE_TIER0_TELEMETRY ? trafficTiming : null);
+        } finally {
+          if (ENABLE_TIER0_TELEMETRY) trafficChartMs = Date.now() - trafficStartedMs;
+        }
         var collectedTraffic = parseTrafficCollector(collectorPayload, targetAsin, actualAsin);
         var trafficGate = evaluateTrafficGate(collectedTraffic, false);
         if (!trafficGate.pass) {
@@ -849,15 +1313,25 @@
         } else {
           currentGate = 'dimensions';
           updateCurrentStep(state, 'dimensions', 'Reading dimensions after traffic pass.');
-          await waitFor(function () { return document.querySelector('#seller-sprite-extension-quick-view-listing,#productOverview_feature_div'); }, 15000, 250);
-          dimensions = extractDimensions();
+          var dimensionsStartedMs = ENABLE_TIER0_TELEMETRY ? Date.now() : null;
+          try {
+            await waitFor(function () { return document.querySelector('#seller-sprite-extension-quick-view-listing,#productOverview_feature_div'); }, 15000, 250);
+            dimensions = extractDimensions();
+          } finally {
+            if (ENABLE_TIER0_TELEMETRY) dimensionsMs = Date.now() - dimensionsStartedMs;
+          }
           var dimensionsGate = evaluateDimensionsGate(dimensions.dimensions);
           if (!dimensionsGate.pass) {
             skippedSteps = ['price'];
           } else {
             currentGate = 'price';
             updateCurrentStep(state, 'price', 'Reading recent price trend after dimensions pass.');
-            priceTrend = await collectPriceTrend();
+            var priceStartedMs = ENABLE_TIER0_TELEMETRY ? Date.now() : null;
+            try {
+              priceTrend = await collectPriceTrend();
+            } finally {
+              if (ENABLE_TIER0_TELEMETRY) priceChartMs = Date.now() - priceStartedMs;
+            }
           }
         }
       } else {
@@ -870,7 +1344,9 @@
     var traffic = parseTrafficCollector(collectorPayload, targetAsin, actualAsin);
     var trafficGate = evaluateTrafficGate(traffic, mismatch);
     var dimensionsGate = trafficGate.pass ? evaluateDimensionsGate(dimensions.dimensions) : { pass: false, stage: 'dimensions', rule: 'not_run', reason: 'traffic did not pass' };
-    var priceGate = trafficGate.pass && dimensionsGate.pass ? evaluatePriceGate(priceTrend.priceTrendClass) : { pass: false, stage: 'price', rule: 'not_run', reason: 'prior gate did not pass' };
+    var priceGate = trafficGate.pass && dimensionsGate.pass
+      ? evaluatePriceGate(priceTrend.priceTrendClass, priceTrend.currentPrice)
+      : { pass: false, stage: 'price', rule: 'not_run', reason: 'prior gate did not pass' };
     var finalGate = errorMessage
       ? { pass: false, stage: currentGate, rule: 'collection_error', reason: errorMessage }
       : (!trafficGate.pass ? trafficGate : (!dimensionsGate.pass ? dimensionsGate : priceGate));
@@ -893,15 +1369,39 @@
       skippedSteps: skippedSteps,
       error: errorMessage
     }, traffic, dimensions, priceTrend);
+    if (ENABLE_TIER0_TELEMETRY) {
+      var timingMeasurements = {
+        detailPageMs: detailPageMs,
+        detailPageMsReason: detailPageMs == null ? 'navigation_start_not_recorded' : '',
+        trafficChartMs: trafficChartMs,
+        trafficChartMsReason: trafficChartMs == null ? (mismatch ? 'asin_mismatch_short_circuit' : 'not_run') : '',
+        dimensionsMs: dimensionsMs,
+        dimensionsMsReason: dimensionsMs == null ? 'not_run_due_to_prior_gate' : '',
+        priceChartMs: priceChartMs,
+        priceChartMsReason: priceChartMs == null ? 'not_run_due_to_prior_gate' : '',
+        retryCount: trafficTiming.retryCount,
+        retryDecision: trafficTiming.retryDecision,
+        retryReason: trafficTiming.retryReason,
+        totalMs: Date.now() - processStartedMs
+      };
+      attachRunnerTelemetry(result, timingMeasurements, state);
+    }
     if (mismatch) result.note = oneLine(result.note + '; asin_mismatch_amazon_redirect');
     if (errorMessage) result.note = oneLine(result.note + '; ' + errorMessage);
     if (strictDecision !== 'pass') result.note = oneLine(result.note + '; short_circuit:' + finalGate.stage + ':' + finalGate.rule);
 
-    state = loadBatch(hash);
-    if (!state) return;
+    state = loadBatch(hash) || state;
+    var strictHistory = strictDecision === 'pass'
+      ? recordStrictQualified(targetAsin, {
+        qualifiedAt: result.finishedAt,
+        batchName: state.batchName,
+        queueHash: state.queueHash
+      })
+      : getStrictHistory();
     state.results[index] = result;
     state.currentIndex = index + 1;
     state.currentStep = 'saved';
+    state.historyRegistryCount = strictHistoryCount(strictHistory);
     state.message = targetAsin + ' ' + strictDecision + ' at ' + (strictDecision === 'pass' ? 'all_gates' : finalGate.stage) + ' in ' + Math.round((Date.now() - Date.parse(startedAt)) / 1000) + 's.';
     saveBatch(state);
 
@@ -916,8 +1416,8 @@
       return;
     }
     await sleep(500);
-    state = loadBatch(hash);
-    if (!state || state.status !== 'running') return;
+    state = loadBatch(hash) || state;
+    if (state.status !== 'running') return;
     navigateToRow(state, state.currentIndex);
   }
 
