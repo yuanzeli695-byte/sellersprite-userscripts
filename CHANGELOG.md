@@ -1,5 +1,12 @@
 # Changelog
 
+## Codex Skill: amazon-us-strict-selection
+
+- Added an installable `skills/amazon-us-strict-selection` package with UI metadata, fail-closed operating rules, browser guidance, workbook acceptance guidance, and engineering governance.
+- Added a portable read-only preflight that supports this public userscript repository and a separately supplied compatible full-workflow project.
+- Removed author-specific paths and business data from the public package; the Skill does not include strict-history ASINs, run artifacts, or the private workbook pipeline.
+- Added repository tests for Skill structure, relative links, UI metadata, privacy, script-version synchronization, repository preflight, and incompatible-root failure.
+
 ## Integrated Runner 0.3.7
 
 - Added gate-profiled local strict-qualified history with queue auto-skip; rule/threshold changes invalidate stale history, and the public build has no preloaded business ASINs.

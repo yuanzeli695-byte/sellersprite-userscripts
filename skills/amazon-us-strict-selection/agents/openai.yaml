@@ -1,0 +1,4 @@
+interface:
+  display_name: "Amazon US Strict Selection"
+  short_description: "Fail-closed SellerSprite screening and workbook delivery"
+  default_prompt: "Use $amazon-us-strict-selection to run or audit an Amazon US selection batch without weakening any hard gate."
