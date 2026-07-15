@@ -32,7 +32,7 @@ Runner 和 Collector 必须配套使用。两者当前协议仍为 `1`，Collect
 - `Copy gate log TSV`：复制门槛审计表，可粘贴到 Excel。
 - `Copy timing log TSV`：复制阶段耗时与重试表。
 - `Copy granular JSON/TSV`：复制导航、握手、存储和渲染 sidecar。
-- `Copy control event TSV`：复制暂停、恢复和停止事件。
+- `Copy control TSV`：复制暂停、恢复和停止事件。
 - `Clear batch`：删除当前批次，不会删除严格合格历史。
 
 TSV 导出会把制表符/换行替换为空格，并为以 `= + - @` 开头的内容加单引号，降低粘贴到 Excel 时触发公式的风险。
