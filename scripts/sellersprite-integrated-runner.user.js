@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SellerSprite Integrated Runner
 // @namespace    amazon-products
-// @version      0.3.7
-// @description  Runs strict traffic, dimensions, current-price, and trend gates with history dedupe and telemetry.
+// @version      0.3.8
+// @description  Runs strict gates with history dedupe, cumulative target control, and granular telemetry.
 // @match        https://www.amazon.com/*
 // @homepageURL  https://github.com/yuanzeli695-byte/sellersprite-userscripts
 // @supportURL   https://github.com/yuanzeli695-byte/sellersprite-userscripts/issues
@@ -15,14 +15,19 @@
 (function () {
   'use strict';
 
-  var VERSION = '0.3.7';
+  var VERSION = '0.3.8';
   var SCHEMA_VERSION = 'sellerSpriteIntegratedBatch/v0.3.0';
   var COLLECTOR_PROTOCOL_VERSION = '1';
   var COLLECTOR_SCHEMA_VERSION = 'sellerSpriteTraffic/v1';
   var ENABLE_TIER0_TELEMETRY = true;
+  var ENABLE_TIER0_GRANULAR_TELEMETRY = true;
+  var ENABLE_P1_CUMULATIVE_TARGET_CONTROL = true;
   var ENABLE_TIER2_2_CONDITIONAL_RETRY = true;
   var TIER2_RETRY_VERSION = 'tier2.2-conditional-retry-v1';
   var TELEMETRY_SCHEMA_VERSION = 'sellerSpriteTelemetry/v1';
+  var GRANULAR_TELEMETRY_SCHEMA_VERSION = 'sellerSpriteGranularTelemetry/v1';
+  var GRANULAR_TELEMETRY_VERSION = 'tier0.2-granular-v1';
+  var TARGET_CONTROL_VERSION = 'p1-cumulative-remaining-v1';
   var STORAGE_PREFIX = 'ssIntegratedRunner:v0.3:';
   var TRAFFIC_MIN_PCT = 70;
   var MIN_REQUIRED_TRAFFIC_WEEKS = 3;
@@ -42,6 +47,12 @@
   var INDEX_KEY = STORAGE_PREFIX + 'index';
   var SELECTED_KEY = STORAGE_PREFIX + 'selected';
   var STRICT_HISTORY_KEY = STORAGE_PREFIX + 'strict-qualified-history';
+  var GRANULAR_STORAGE_PREFIX = STORAGE_PREFIX + 'granular:v1:';
+  var RUNNER_INJECTED_AT_MS = Date.now();
+  var RUNNER_DOCUMENT_READY_STATE = typeof document === 'undefined' ? '' : document.readyState;
+  var ACTIVE_ROW_TIMING = null;
+  var ACTIVE_GRANULAR_CONTEXT = null;
+  var LAST_GRANULAR_TELEMETRY_ERROR = '';
   // Public builds start empty. Add only ASINs that your own deployment may skip.
   var BOOTSTRAP_STRICT_QUALIFIED_ASINS = [];
   var AUTO_PARAM = 'ss-v3';
@@ -60,6 +71,23 @@
     'detailPageMs', 'detailPageMsReason', 'trafficChartMs', 'trafficChartMsReason',
     'dimensionsMs', 'dimensionsMsReason', 'priceChartMs', 'priceChartMsReason',
     'retryCount', 'retryDecision', 'retryReason', 'totalMs'
+  ];
+  var GRANULAR_TIMING_COLUMNS = [
+    'row', 'asin', 'batchName', 'queueHash', 'runnerVersion', 'collectorVersion',
+    'navigationIntentAtMs', 'navigationStartAtMs', 'amazonDomReadyAtMs', 'runnerInjectedAtMs',
+    'autoProcessStartedAtMs', 'navigationType', 'preNavigationMs', 'navigationDomMs',
+    'domToRunnerInjectionMs', 'runnerBootDelayMs', 'documentReadyState',
+    'trafficTabClickAtMs', 'trafficTabClickFound', 'trafficChartReadyAtMs',
+    'trafficTabToChartReadyMs', 'collectorAttempts', 'persistenceCallCount',
+    'serializeTotalMs', 'storageWriteTotalMs', 'persistenceTotalMs', 'persistenceMaxMs',
+    'panelRenderCallCount', 'panelRenderTotalMs', 'panelRenderMaxMs', 'panelJsonSerializeMs',
+    'autoStartRequestedMs', 'autoStartActualMs', 'interRowRequestedMs', 'interRowActualMs',
+    'postResultToNextNavigationMs', 'pauseRecoveryMs', 'resultFinishedAtMs', 'flushAtMs',
+    'missingReason'
+  ];
+  var CONTROL_EVENT_COLUMNS = [
+    'atMs', 'event', 'row', 'asin', 'stepBefore', 'statusBefore', 'pauseId',
+    'pauseDurationMs', 'recoveryKind', 'recoveryEvidence', 'reason'
   ];
 
   function oneLine(value) {
@@ -237,6 +265,119 @@
     var completed = (results || []).filter(Boolean).length;
     var qualified = (results || []).filter(isQualifiedResult).length;
     return { completed: completed, qualified: qualified, rejected: completed - qualified };
+  }
+
+  function nonNegativeIntegerOrNull(value) {
+    if (value === null || value === undefined || value === '') return null;
+    var number = Number(value);
+    return Number.isInteger(number) && number >= 0 ? number : null;
+  }
+
+  function positiveIntegerOrNull(value) {
+    var number = nonNegativeIntegerOrNull(value);
+    return number !== null && number > 0 ? number : null;
+  }
+
+  function normalizeTargetControl(state) {
+    state = state || {};
+    var requested = positiveIntegerOrNull(state.requestedFinalTargetAtStart);
+    var legacyTarget = positiveIntegerOrNull(state.targetQualified);
+    var hasRemaining = ENABLE_P1_CUMULATIVE_TARGET_CONTROL
+      && state.targetControlVersion === TARGET_CONTROL_VERSION;
+    var remaining = hasRemaining ? nonNegativeIntegerOrNull(state.remainingTargetAtStart) : null;
+    if (hasRemaining && remaining === null) {
+      return { valid: false, mode: 'cumulative_remaining', reason: 'remaining_target_missing_or_invalid' };
+    }
+    requested = requested || legacyTarget || 20;
+    var effective = remaining === null ? (legacyTarget || requested) : remaining;
+    if (effective > requested) {
+      return { valid: false, mode: 'cumulative_remaining', reason: 'remaining_target_exceeds_requested_target' };
+    }
+    return {
+      valid: true,
+      mode: remaining === null ? 'legacy_batch' : 'cumulative_remaining',
+      requestedFinalTargetAtStart: requested,
+      remainingTargetAtStart: remaining,
+      effectiveStopBudget: effective,
+      version: remaining === null ? '' : TARGET_CONTROL_VERSION
+    };
+  }
+
+  function effectiveStopBudget(state) {
+    var control = normalizeTargetControl(state);
+    return control.valid ? control.effectiveStopBudget : null;
+  }
+
+  function browserPassesThisBatch(state) {
+    return summarizeResults((state || {}).results).qualified;
+  }
+
+  function stopDecision(state) {
+    var control = normalizeTargetControl(state);
+    var passes = browserPassesThisBatch(state);
+    if (!control.valid) {
+      return { stop: true, reason: 'invalid_target_control', action: 'fail_closed', passes: passes, control: control };
+    }
+    if (state && state.stopAfterCurrentRowRequested) {
+      return { stop: true, reason: 'operator_stop_after_current_row', action: 'stop_after_current_row', passes: passes, control: control };
+    }
+    if (control.effectiveStopBudget === 0) {
+      return { stop: true, reason: 'target_already_reached', action: 'none', passes: passes, control: control };
+    }
+    if (passes >= control.effectiveStopBudget) {
+      return { stop: true, reason: 'target_reached', action: 'stop_after_current_row', passes: passes, control: control };
+    }
+    return { stop: false, reason: '', action: '', passes: passes, control: control };
+  }
+
+  function requestStopAfterCurrentRow(state, source) {
+    state = state || {};
+    state.stopAfterCurrentRowRequested = true;
+    state.stopAction = source || 'operator_stop_after_current_row';
+    state.message = 'Stop requested; the current row will finish and be saved.';
+    return state;
+  }
+
+  function mergeLatestControlState(state, latestState) {
+    if (!state || !latestState || state.queueHash !== latestState.queueHash) return state;
+    [
+      'status',
+      'stopAfterCurrentRowRequested',
+      'stopAction',
+      'stoppedReason',
+      'stopReason',
+      'pauseId',
+      'pausedAtMs',
+      'pausedFromStatus',
+      'pausedFromStep',
+      'pendingPauseRecoveryMs'
+    ].forEach(function (field) {
+      if (Object.prototype.hasOwnProperty.call(latestState, field)) state[field] = latestState[field];
+    });
+    return state;
+  }
+
+  function isCurrentAutoRowInFlight(state) {
+    if (!state || !Array.isArray(state.queue) || !Array.isArray(state.results)) return false;
+    var index = Number(state.currentIndex);
+    if (!Number.isInteger(index) || index < 0 || index >= state.queue.length) return false;
+    var step = state.status === 'paused' && state.pausedFromStatus === 'running'
+      ? state.pausedFromStep
+      : state.currentStep;
+    return !state.results[index] && ['traffic', 'dimensions', 'price'].indexOf(step) >= 0;
+  }
+
+  function mergeGranularRowSidecar(latestSidecar, fallbackSidecar, index, row) {
+    var fallback = fallbackSidecar || {};
+    var latestIsCompatible = latestSidecar
+      && latestSidecar.schemaVersion === GRANULAR_TELEMETRY_SCHEMA_VERSION
+      && latestSidecar.queueHash
+      && latestSidecar.queueHash === fallback.queueHash
+      && (latestSidecar.batchCreatedAt || '') === (fallback.batchCreatedAt || '');
+    var sidecar = latestIsCompatible ? latestSidecar : fallback;
+    if (!sidecar.rowsByIndex || typeof sidecar.rowsByIndex !== 'object') sidecar.rowsByIndex = {};
+    sidecar.rowsByIndex[String(index)] = row;
+    return sidecar;
   }
 
   function gateCodeForStage(stage) {
@@ -563,8 +704,18 @@
     buildHistorySkipTimingLogRow: buildHistorySkipTimingLogRow,
     attachRunnerTelemetry: attachRunnerTelemetry,
     rowsToTsv: rowsToTsv,
+    normalizeTargetControl: normalizeTargetControl,
+    effectiveStopBudget: effectiveStopBudget,
+    browserPassesThisBatch: browserPassesThisBatch,
+    stopDecision: stopDecision,
+    requestStopAfterCurrentRow: requestStopAfterCurrentRow,
+    mergeLatestControlState: mergeLatestControlState,
+    isCurrentAutoRowInFlight: isCurrentAutoRowInFlight,
+    mergeGranularRowSidecar: mergeGranularRowSidecar,
     gateLogColumns: GATE_LOG_COLUMNS.slice(),
     timingLogColumns: TIMING_LOG_COLUMNS.slice(),
+    granularTimingColumns: GRANULAR_TIMING_COLUMNS.slice(),
+    controlEventColumns: CONTROL_EVENT_COLUMNS.slice(),
     telemetryEnabled: ENABLE_TIER0_TELEMETRY,
     trafficMinPct: TRAFFIC_MIN_PCT,
     minRequiredTrafficWeeks: MIN_REQUIRED_TRAFFIC_WEEKS,
@@ -572,8 +723,12 @@
     priceMinUsd: PRICE_MIN_USD,
     priceMaxUsd: PRICE_MAX_USD,
     priceTrendAllowlist: PRICE_TREND_ALLOWLIST.slice(),
+    granularTelemetryEnabled: ENABLE_TIER0_GRANULAR_TELEMETRY,
+    cumulativeTargetControlEnabled: ENABLE_P1_CUMULATIVE_TARGET_CONTROL,
     tier22ConditionalRetryEnabled: ENABLE_TIER2_2_CONDITIONAL_RETRY,
     tier2RetryVersion: TIER2_RETRY_VERSION,
+    granularTelemetryVersion: GRANULAR_TELEMETRY_VERSION,
+    targetControlVersion: TARGET_CONTROL_VERSION,
     maxCollectorRetries: 1,
     strictHistorySchemaVersion: STRICT_HISTORY_SCHEMA_VERSION,
     strictGateProfile: STRICT_GATE_PROFILE,
@@ -653,7 +808,324 @@
   }
 
   function writeJson(key, value) {
-    localStorage.setItem(key, JSON.stringify(value));
+    return writeJsonMeasured(key, value);
+  }
+
+  function writeJsonMeasured(key, value) {
+    var serializeStartedAtMs = Date.now();
+    var serialized = JSON.stringify(value);
+    var serializeMs = Date.now() - serializeStartedAtMs;
+    var storageStartedAtMs = Date.now();
+    localStorage.setItem(key, serialized);
+    var storageWriteMs = Date.now() - storageStartedAtMs;
+    return {
+      serializeMs: serializeMs,
+      storageWriteMs: storageWriteMs,
+      totalMs: serializeMs + storageWriteMs
+    };
+  }
+
+  function granularKey(hash) {
+    return GRANULAR_STORAGE_PREFIX + hash;
+  }
+
+  function emptyGranularSidecar(state) {
+    return {
+      schemaVersion: GRANULAR_TELEMETRY_SCHEMA_VERSION,
+      instrumentationVersion: GRANULAR_TELEMETRY_VERSION,
+      queueHash: (state || {}).queueHash || '',
+      batchName: (state || {}).batchName || '',
+      batchCreatedAt: (state || {}).createdAt || '',
+      rowsByIndex: {},
+      controlEvents: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  function loadGranularSidecar(state) {
+    if (!ENABLE_TIER0_GRANULAR_TELEMETRY || !state || !state.queueHash) return null;
+    var sidecar = readJson(granularKey(state.queueHash), null);
+    if (!sidecar
+        || sidecar.schemaVersion !== GRANULAR_TELEMETRY_SCHEMA_VERSION
+        || sidecar.queueHash !== state.queueHash
+        || (sidecar.batchCreatedAt || '') !== (state.createdAt || '')) {
+      return emptyGranularSidecar(state);
+    }
+    if (!sidecar.rowsByIndex || typeof sidecar.rowsByIndex !== 'object') sidecar.rowsByIndex = {};
+    if (!Array.isArray(sidecar.controlEvents)) sidecar.controlEvents = [];
+    return sidecar;
+  }
+
+  function saveGranularSidecar(sidecar) {
+    if (!ENABLE_TIER0_GRANULAR_TELEMETRY || !sidecar || !sidecar.queueHash) return null;
+    try {
+      sidecar.updatedAt = new Date().toISOString();
+      var measurement = writeJsonMeasured(granularKey(sidecar.queueHash), sidecar);
+      LAST_GRANULAR_TELEMETRY_ERROR = '';
+      return measurement;
+    } catch (error) {
+      LAST_GRANULAR_TELEMETRY_ERROR = oneLine(error && error.message ? error.message : error);
+      return null;
+    }
+  }
+
+  function clearGranularSidecar(hash) {
+    if (!ENABLE_TIER0_GRANULAR_TELEMETRY || !hash) return;
+    try {
+      localStorage.removeItem(granularKey(hash));
+      LAST_GRANULAR_TELEMETRY_ERROR = '';
+    } catch (error) {
+      LAST_GRANULAR_TELEMETRY_ERROR = oneLine(error && error.message ? error.message : error);
+    }
+  }
+
+  function navigationTimingSnapshot() {
+    if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') {
+      return { navigationStartAtMs: null, amazonDomReadyAtMs: null, navigationType: '', reason: 'performance_navigation_unavailable' };
+    }
+    var entry = performance.getEntriesByType('navigation')[0];
+    if (!entry || !Number.isFinite(Number(performance.timeOrigin))) {
+      return { navigationStartAtMs: null, amazonDomReadyAtMs: null, navigationType: '', reason: 'navigation_entry_unavailable' };
+    }
+    var origin = Number(performance.timeOrigin);
+    var domReady = Number(entry.domContentLoadedEventEnd);
+    return {
+      navigationStartAtMs: origin + Number(entry.startTime || 0),
+      amazonDomReadyAtMs: Number.isFinite(domReady) && domReady > 0 ? origin + domReady : null,
+      navigationType: entry.type || '',
+      reason: Number.isFinite(domReady) && domReady > 0 ? '' : 'dom_ready_timing_unavailable'
+    };
+  }
+
+  function createGranularRow(state, index) {
+    var navigation = navigationTimingSnapshot();
+    return {
+      row: index + 1,
+      asin: state.queue[index] || '',
+      runnerVersion: VERSION,
+      collectorVersion: '',
+      navigation: {
+        navigationIntentAtMs: null,
+        navigationStartAtMs: navigation.navigationStartAtMs,
+        amazonDomReadyAtMs: navigation.amazonDomReadyAtMs,
+        runnerInjectedAtMs: RUNNER_INJECTED_AT_MS,
+        autoProcessStartedAtMs: null,
+        navigationType: navigation.navigationType,
+        preNavigationMs: null,
+        navigationDomMs: navigation.navigationStartAtMs !== null && navigation.amazonDomReadyAtMs !== null
+          ? Math.max(0, navigation.amazonDomReadyAtMs - navigation.navigationStartAtMs)
+          : null,
+        domToRunnerInjectionMs: navigation.amazonDomReadyAtMs !== null
+          ? Math.max(0, RUNNER_INJECTED_AT_MS - navigation.amazonDomReadyAtMs)
+          : null,
+        runnerBootDelayMs: null,
+        documentReadyState: RUNNER_DOCUMENT_READY_STATE,
+        reason: navigation.reason
+      },
+      sellerSprite: {
+        collectorButtonObservedAtMs: null,
+        sellerSpriteUiFirstObservedAtMs: null,
+        trafficTabClickAtMs: null,
+        trafficTabClickFound: null,
+        trafficChartReadyAtMs: null,
+        trafficTabToChartReadyMs: null,
+        reason: ''
+      },
+      collectorAttempts: [],
+      persistence: {
+        callCount: 0,
+        serializeTotalMs: 0,
+        storageWriteTotalMs: 0,
+        persistenceTotalMs: 0,
+        persistenceMaxMs: 0,
+        panelRenderCallCount: 0,
+        panelRenderTotalMs: 0,
+        panelRenderMaxMs: 0,
+        panelJsonSerializeMs: 0
+      },
+      delays: {
+        autoStartRequestedMs: 400,
+        autoStartActualMs: null,
+        interRowRequestedMs: 500,
+        interRowActualMs: null,
+        postResultToNextNavigationMs: null,
+        pauseRecoveryMs: Number.isFinite(Number(state.pendingPauseRecoveryMs)) ? Number(state.pendingPauseRecoveryMs) : null
+      },
+      completion: {
+        resultFinishedAtMs: null,
+        flushAtMs: null,
+        missingReason: ''
+      }
+    };
+  }
+
+  function recordGranularNavigationIntent(state, index, atMs) {
+    if (!ENABLE_TIER0_GRANULAR_TELEMETRY) return;
+    var sidecar = loadGranularSidecar(state);
+    if (!sidecar) return;
+    var key = String(index);
+    var row = sidecar.rowsByIndex[key] || createGranularRow(state, index);
+    row.navigation.navigationIntentAtMs = atMs;
+    sidecar.rowsByIndex[key] = row;
+    saveGranularSidecar(sidecar);
+  }
+
+  function beginGranularRow(state, index, processStartedAtMs) {
+    if (!ENABLE_TIER0_GRANULAR_TELEMETRY) return null;
+    var sidecar = loadGranularSidecar(state);
+    if (!sidecar) return null;
+    var key = String(index);
+    var row = sidecar.rowsByIndex[key] || createGranularRow(state, index);
+    var navigation = navigationTimingSnapshot();
+    row.navigation.navigationStartAtMs = navigation.navigationStartAtMs;
+    row.navigation.amazonDomReadyAtMs = navigation.amazonDomReadyAtMs;
+    row.navigation.navigationType = navigation.navigationType;
+    row.navigation.reason = navigation.reason;
+    row.navigation.runnerInjectedAtMs = RUNNER_INJECTED_AT_MS;
+    row.navigation.autoProcessStartedAtMs = processStartedAtMs;
+    row.navigation.preNavigationMs = Number.isFinite(Number(row.navigation.navigationIntentAtMs))
+      ? Math.max(0, RUNNER_INJECTED_AT_MS - Number(row.navigation.navigationIntentAtMs))
+      : null;
+    row.navigation.navigationDomMs = navigation.navigationStartAtMs !== null && navigation.amazonDomReadyAtMs !== null
+      ? Math.max(0, navigation.amazonDomReadyAtMs - navigation.navigationStartAtMs)
+      : null;
+    row.navigation.domToRunnerInjectionMs = navigation.amazonDomReadyAtMs !== null
+      ? Math.max(0, RUNNER_INJECTED_AT_MS - navigation.amazonDomReadyAtMs)
+      : null;
+    row.navigation.runnerBootDelayMs = Math.max(0, processStartedAtMs - RUNNER_INJECTED_AT_MS);
+    row.delays.autoStartActualMs = row.navigation.runnerBootDelayMs;
+    sidecar.rowsByIndex[key] = row;
+    ACTIVE_ROW_TIMING = {
+      callCount: 0,
+      serializeTotalMs: 0,
+      storageWriteTotalMs: 0,
+      persistenceTotalMs: 0,
+      persistenceMaxMs: 0,
+      panelRenderCallCount: 0,
+      panelRenderTotalMs: 0,
+      panelRenderMaxMs: 0,
+      panelJsonSerializeMs: 0
+    };
+    ACTIVE_GRANULAR_CONTEXT = { sidecar: sidecar, row: row, index: index };
+    saveGranularSidecar(sidecar);
+    return row;
+  }
+
+  function recordActivePersistence(measurement, panelRenderMs) {
+    if (!ACTIVE_ROW_TIMING) return;
+    ACTIVE_ROW_TIMING.callCount += 1;
+    ACTIVE_ROW_TIMING.serializeTotalMs += measurement.serializeMs;
+    ACTIVE_ROW_TIMING.storageWriteTotalMs += measurement.storageWriteMs;
+    ACTIVE_ROW_TIMING.persistenceTotalMs += measurement.totalMs;
+    ACTIVE_ROW_TIMING.persistenceMaxMs = Math.max(ACTIVE_ROW_TIMING.persistenceMaxMs, measurement.totalMs);
+    ACTIVE_ROW_TIMING.panelRenderCallCount += 1;
+    ACTIVE_ROW_TIMING.panelRenderTotalMs += panelRenderMs;
+    ACTIVE_ROW_TIMING.panelRenderMaxMs = Math.max(ACTIVE_ROW_TIMING.panelRenderMaxMs, panelRenderMs);
+  }
+
+  function recordPanelJsonSerialize(ms) {
+    if (ACTIVE_ROW_TIMING) ACTIVE_ROW_TIMING.panelJsonSerializeMs += ms;
+  }
+
+  function finalizeActiveGranular(reason, nextNavigationAtMs) {
+    if (!ACTIVE_GRANULAR_CONTEXT) return;
+    var context = ACTIVE_GRANULAR_CONTEXT;
+    if (ACTIVE_ROW_TIMING) context.row.persistence = Object.assign({}, context.row.persistence, ACTIVE_ROW_TIMING);
+    if (Number.isFinite(Number(nextNavigationAtMs)) && Number.isFinite(Number(context.row.completion.resultFinishedAtMs))) {
+      var interval = Math.max(0, Number(nextNavigationAtMs) - Number(context.row.completion.resultFinishedAtMs));
+      context.row.delays.interRowActualMs = interval;
+      context.row.delays.postResultToNextNavigationMs = interval;
+    }
+    context.row.completion.flushAtMs = Date.now();
+    context.row.completion.missingReason = reason || '';
+    var latestSidecar = loadGranularSidecar({
+      queueHash: context.sidecar.queueHash,
+      batchName: context.sidecar.batchName,
+      createdAt: context.sidecar.batchCreatedAt
+    });
+    saveGranularSidecar(mergeGranularRowSidecar(latestSidecar, context.sidecar, context.index, context.row));
+    ACTIVE_ROW_TIMING = null;
+    ACTIVE_GRANULAR_CONTEXT = null;
+  }
+
+  function recordControlEvent(state, event, details) {
+    if (!ENABLE_TIER0_GRANULAR_TELEMETRY || !state) return;
+    var sidecar = loadGranularSidecar(state);
+    if (!sidecar) return;
+    details = details || {};
+    sidecar.controlEvents.push({
+      atMs: Date.now(),
+      event: event,
+      row: Number.isInteger(Number(details.row)) ? Number(details.row) : Number(state.currentIndex || 0) + 1,
+      asin: details.asin || state.queue[state.currentIndex] || '',
+      stepBefore: details.stepBefore || state.currentStep || '',
+      statusBefore: details.statusBefore || state.status || '',
+      pauseId: details.pauseId || '',
+      pauseDurationMs: Number.isFinite(Number(details.pauseDurationMs)) ? Number(details.pauseDurationMs) : null,
+      recoveryKind: details.recoveryKind || '',
+      recoveryEvidence: details.recoveryEvidence || '',
+      reason: details.reason || ''
+    });
+    saveGranularSidecar(sidecar);
+  }
+
+  function granularTimingRows(sidecar) {
+    if (!sidecar || !sidecar.rowsByIndex) return [];
+    return Object.keys(sidecar.rowsByIndex).sort(function (a, b) { return Number(a) - Number(b); }).map(function (key) {
+      var row = sidecar.rowsByIndex[key];
+      var navigation = row.navigation || {};
+      var sellerSprite = row.sellerSprite || {};
+      var persistence = row.persistence || {};
+      var delays = row.delays || {};
+      var completion = row.completion || {};
+      return {
+        row: row.row,
+        asin: row.asin,
+        batchName: sidecar.batchName,
+        queueHash: sidecar.queueHash,
+        runnerVersion: row.runnerVersion || VERSION,
+        collectorVersion: row.collectorVersion || '',
+        navigationIntentAtMs: navigation.navigationIntentAtMs,
+        navigationStartAtMs: navigation.navigationStartAtMs,
+        amazonDomReadyAtMs: navigation.amazonDomReadyAtMs,
+        runnerInjectedAtMs: navigation.runnerInjectedAtMs,
+        autoProcessStartedAtMs: navigation.autoProcessStartedAtMs,
+        navigationType: navigation.navigationType || '',
+        preNavigationMs: navigation.preNavigationMs,
+        navigationDomMs: navigation.navigationDomMs,
+        domToRunnerInjectionMs: navigation.domToRunnerInjectionMs,
+        runnerBootDelayMs: navigation.runnerBootDelayMs,
+        documentReadyState: navigation.documentReadyState || '',
+        trafficTabClickAtMs: sellerSprite.trafficTabClickAtMs,
+        trafficTabClickFound: sellerSprite.trafficTabClickFound,
+        trafficChartReadyAtMs: sellerSprite.trafficChartReadyAtMs,
+        trafficTabToChartReadyMs: sellerSprite.trafficTabToChartReadyMs,
+        collectorAttempts: row.collectorAttempts || [],
+        persistenceCallCount: persistence.callCount,
+        serializeTotalMs: persistence.serializeTotalMs,
+        storageWriteTotalMs: persistence.storageWriteTotalMs,
+        persistenceTotalMs: persistence.persistenceTotalMs,
+        persistenceMaxMs: persistence.persistenceMaxMs,
+        panelRenderCallCount: persistence.panelRenderCallCount,
+        panelRenderTotalMs: persistence.panelRenderTotalMs,
+        panelRenderMaxMs: persistence.panelRenderMaxMs,
+        panelJsonSerializeMs: persistence.panelJsonSerializeMs,
+        autoStartRequestedMs: delays.autoStartRequestedMs,
+        autoStartActualMs: delays.autoStartActualMs,
+        interRowRequestedMs: delays.interRowRequestedMs,
+        interRowActualMs: delays.interRowActualMs,
+        postResultToNextNavigationMs: delays.postResultToNextNavigationMs,
+        pauseRecoveryMs: delays.pauseRecoveryMs,
+        resultFinishedAtMs: completion.resultFinishedAtMs,
+        flushAtMs: completion.flushAtMs,
+        missingReason: completion.missingReason || navigation.reason || sellerSprite.reason || ''
+      };
+    });
+  }
+
+  function controlEventRows(sidecar) {
+    return sidecar && Array.isArray(sidecar.controlEvents) ? sidecar.controlEvents.slice() : [];
   }
 
   function normalizeStrictHistory(history) {
@@ -723,18 +1195,37 @@
 
   function saveBatch(state) {
     var summary = summarizeResults(state.results);
-    state.targetQualified = Number.isInteger(Number(state.targetQualified)) && Number(state.targetQualified) > 0 ? Number(state.targetQualified) : 20;
+    var targetControl = normalizeTargetControl(state);
+    if (targetControl.valid) {
+      state.targetQualified = targetControl.requestedFinalTargetAtStart;
+      state.requestedFinalTargetAtStart = targetControl.requestedFinalTargetAtStart;
+      state.remainingTargetAtStart = targetControl.remainingTargetAtStart;
+      state.targetControlVersion = targetControl.version;
+    }
     state.qualifiedCount = summary.qualified;
+    state.browserPassesThisBatch = summary.qualified;
+    state.remainingTargetAfterBrowser = targetControl.valid && targetControl.remainingTargetAtStart !== null
+      ? Math.max(0, targetControl.remainingTargetAtStart - summary.qualified)
+      : null;
     state.rejectedCount = summary.rejected;
     state.historySkippedCount = (state.historySkippedAsins || []).length;
     state.historyGateProfile = STRICT_GATE_PROFILE;
     state.updatedAt = new Date().toISOString();
-    writeJson(stateKey(state.queueHash), state);
+    var stateWrite = writeJson(stateKey(state.queueHash), state);
     var index = getBatchIndex().filter(function (item) { return item.queueHash !== state.queueHash; });
     index.unshift({ queueHash: state.queueHash, batchName: state.batchName, createdAt: state.createdAt });
-    writeJson(INDEX_KEY, index.slice(0, 30));
+    var indexWrite = writeJson(INDEX_KEY, index.slice(0, 30));
+    var selectedWriteStartedAtMs = Date.now();
     localStorage.setItem(SELECTED_KEY, state.queueHash);
+    var selectedWriteMs = Date.now() - selectedWriteStartedAtMs;
+    var persistenceMeasurement = {
+      serializeMs: stateWrite.serializeMs + indexWrite.serializeMs,
+      storageWriteMs: stateWrite.storageWriteMs + indexWrite.storageWriteMs + selectedWriteMs,
+      totalMs: stateWrite.totalMs + indexWrite.totalMs + selectedWriteMs
+    };
+    var renderStartedAtMs = Date.now();
     renderPanel();
+    recordActivePersistence(persistenceMeasurement, Date.now() - renderStartedAtMs);
   }
 
   function loadBatch(hash) {
@@ -786,6 +1277,13 @@
       status: state.status,
       currentIndex: state.currentIndex,
       targetQualified: state.targetQualified,
+      requestedFinalTargetAtStart: state.requestedFinalTargetAtStart || state.targetQualified,
+      remainingTargetAtStart: state.remainingTargetAtStart == null ? null : state.remainingTargetAtStart,
+      remainingTargetAfterBrowser: state.remainingTargetAfterBrowser == null ? null : state.remainingTargetAfterBrowser,
+      browserPassesThisBatch: state.browserPassesThisBatch || 0,
+      targetControlVersion: state.targetControlVersion || '',
+      stopAfterCurrentRowRequested: Boolean(state.stopAfterCurrentRowRequested),
+      stopAction: state.stopAction || '',
       qualifiedCount: state.qualifiedCount,
       rejectedCount: state.rejectedCount,
       historySkippedAsins: state.historySkippedAsins || [],
@@ -866,21 +1364,35 @@
       ? '<button id="ss-v3-copy-gate-tsv">Copy gate log TSV</button>' +
         '<button id="ss-v3-copy-timing-tsv">Copy timing log TSV</button>'
       : '';
+    var granularButtons = ENABLE_TIER0_GRANULAR_TELEMETRY
+      ? '<button id="ss-v3-copy-granular-json">Copy granular JSON</button>' +
+        '<button id="ss-v3-copy-granular-tsv">Copy granular TSV</button>' +
+        '<button id="ss-v3-copy-control-tsv">Copy control TSV</button>'
+      : '';
+    var targetControlFields = ENABLE_P1_CUMULATIVE_TARGET_CONTROL
+      ? '<label>remainingTargetAtStart (offline replay snapshot, optional)</label><input id="ss-v3-remaining" type="number" min="0" placeholder="blank = legacy batch target">'
+      : '';
+    var stopRowButton = ENABLE_P1_CUMULATIVE_TARGET_CONTROL
+      ? '<button id="ss-v3-stop-row">Stop after current row</button>'
+      : '';
     panel.innerHTML = [
       '<h3>SellerSprite Integrated Runner ' + VERSION + ' <button id="ss-v3-toggle">收起</button></h3>',
       '<div class="ss-v3-body">',
       '<label>Local batches</label><select id="ss-v3-picker"></select>',
        '<label>batchName</label><input id="ss-v3-name" value="strict20-integrated-' + new Date().toISOString().slice(0, 10) + '">',
        '<label>operator</label><input id="ss-v3-operator" value="">',
-       '<label>targetQualified</label><input id="ss-v3-target" type="number" min="1" value="20">',
+       '<label>targetQualified (final target)</label><input id="ss-v3-target" type="number" min="1" value="20">',
+       targetControlFields,
        '<label>QUEUE input</label><textarea id="ss-v3-queue" placeholder="One ASIN per line"></textarea>',
       '<button id="ss-v3-generate">Generate</button><span id="ss-v3-message"></span><br>',
       '<button class="ss-v3-primary" id="ss-v3-start">Start</button>',
-      '<button id="ss-v3-pause">Pause</button>',
-      '<button id="ss-v3-resume">Resume</button>',
+       '<button id="ss-v3-pause">Pause</button>',
+       '<button id="ss-v3-resume">Resume</button>',
+       stopRowButton,
       '<button id="ss-v3-copy">Copy combined JSON</button>',
       '<button id="ss-v3-copy-enrichment">Copy enrichment JSON</button>',
-      telemetryButtons,
+       telemetryButtons,
+       granularButtons,
       '<button id="ss-v3-clear">Clear batch</button>',
       '<pre id="ss-v3-status">No batch selected.</pre>',
       '<textarea id="ss-v3-output" readonly></textarea>',
@@ -900,11 +1412,19 @@
     panel.querySelector('#ss-v3-start').addEventListener('click', startSelectedBatch);
     panel.querySelector('#ss-v3-pause').addEventListener('click', pauseSelectedBatch);
     panel.querySelector('#ss-v3-resume').addEventListener('click', resumeSelectedBatch);
+    if (ENABLE_P1_CUMULATIVE_TARGET_CONTROL) {
+      panel.querySelector('#ss-v3-stop-row').addEventListener('click', stopAfterCurrentRowSelectedBatch);
+    }
     panel.querySelector('#ss-v3-copy').addEventListener('click', function () { copySelected(false); });
     panel.querySelector('#ss-v3-copy-enrichment').addEventListener('click', function () { copySelected(true); });
     if (ENABLE_TIER0_TELEMETRY) {
       panel.querySelector('#ss-v3-copy-gate-tsv').addEventListener('click', function () { copyTelemetry('gate'); });
       panel.querySelector('#ss-v3-copy-timing-tsv').addEventListener('click', function () { copyTelemetry('timing'); });
+    }
+    if (ENABLE_TIER0_GRANULAR_TELEMETRY) {
+      panel.querySelector('#ss-v3-copy-granular-json').addEventListener('click', function () { copyGranularTelemetry('json'); });
+      panel.querySelector('#ss-v3-copy-granular-tsv').addEventListener('click', function () { copyGranularTelemetry('timing'); });
+      panel.querySelector('#ss-v3-copy-control-tsv').addEventListener('click', function () { copyGranularTelemetry('control'); });
     }
     panel.querySelector('#ss-v3-clear').addEventListener('click', clearSelectedBatch);
     renderPanel();
@@ -938,24 +1458,33 @@
     }
     panel.querySelector('#ss-v3-name').value = state.batchName;
     panel.querySelector('#ss-v3-operator').value = state.operator;
-    panel.querySelector('#ss-v3-target').value = state.targetQualified || 20;
+    panel.querySelector('#ss-v3-target').value = state.requestedFinalTargetAtStart || state.targetQualified || 20;
+    var remainingInput = panel.querySelector('#ss-v3-remaining');
+    if (remainingInput) remainingInput.value = state.remainingTargetAtStart == null ? '' : state.remainingTargetAtStart;
     panel.querySelector('#ss-v3-queue').value = state.queue.join('\n');
     var summary = summarizeResults(state.results);
+    var targetControl = normalizeTargetControl(state);
     panel.querySelector('#ss-v3-status').textContent = [
       'Batch: ' + state.batchName,
       'Queue hash: ' + state.queueHash,
       'Status: ' + state.status,
       'Progress: ' + summary.completed + '/' + state.queue.length,
-      'Qualified: ' + summary.qualified + '/' + (state.targetQualified || 20),
+      'Final target: ' + (state.targetQualified || 20),
+      'Target control: ' + targetControl.mode + ' / effective stop ' + (targetControl.valid ? targetControl.effectiveStopBudget : 'INVALID'),
+      'Remaining at start: ' + (state.remainingTargetAtStart == null ? 'n/a' : state.remainingTargetAtStart),
+      'Browser passes this batch: ' + summary.qualified + '/' + (targetControl.valid ? targetControl.effectiveStopBudget : 'INVALID'),
       'Rejected: ' + summary.rejected,
       'History auto-skipped: ' + (state.historySkippedAsins || []).length,
       'Local strict-qualified history: ' + historyCount,
       'Current row: ' + (state.currentIndex + 1),
       'Current ASIN: ' + (state.queue[state.currentIndex] || ''),
       'Step: ' + (state.currentStep || 'idle'),
+      'Stop-after-row requested: ' + (state.stopAfterCurrentRowRequested ? 'yes' : 'no'),
       'Message: ' + (state.message || '')
     ].join('\n');
+    var panelJsonStartedAtMs = Date.now();
     panel.querySelector('#ss-v3-output').value = JSON.stringify(exportBatch(state), null, 2);
+    recordPanelJsonSerialize(Date.now() - panelJsonStartedAtMs);
   }
 
   function generateBatchFromPanel() {
@@ -973,9 +1502,25 @@
     }
     var batchName = oneLine(document.querySelector('#ss-v3-name').value) || ('integrated-' + Date.now());
     var operator = oneLine(document.querySelector('#ss-v3-operator').value) || 'operator';
-    var targetQualified = Number(document.querySelector('#ss-v3-target').value);
-    if (!Number.isInteger(targetQualified) || targetQualified < 1) targetQualified = 20;
-    var hash = fnv1a(batchName + '\n' + operator + '\n' + targetQualified + '\n' + queue.join('\n'));
+    var requestedFinalTargetAtStart = Number(document.querySelector('#ss-v3-target').value);
+    if (!Number.isInteger(requestedFinalTargetAtStart) || requestedFinalTargetAtStart < 1) requestedFinalTargetAtStart = 20;
+    var remainingInput = document.querySelector('#ss-v3-remaining');
+    var remainingText = remainingInput ? String(remainingInput.value || '').trim() : '';
+    var remainingTargetAtStart = remainingText === '' ? null : nonNegativeIntegerOrNull(remainingText);
+    if (ENABLE_P1_CUMULATIVE_TARGET_CONTROL && remainingText !== '' && remainingTargetAtStart === null) {
+      setPanelMessage('remainingTargetAtStart must be a non-negative integer.');
+      return;
+    }
+    if (ENABLE_P1_CUMULATIVE_TARGET_CONTROL && remainingTargetAtStart !== null && remainingTargetAtStart > requestedFinalTargetAtStart) {
+      setPanelMessage('remainingTargetAtStart cannot exceed targetQualified.');
+      return;
+    }
+    if (ENABLE_P1_CUMULATIVE_TARGET_CONTROL && remainingTargetAtStart === 0) {
+      setPanelMessage('Offline replay already reached the target; no browser batch is generated.');
+      return;
+    }
+    var targetQualified = requestedFinalTargetAtStart;
+    var hash = fnv1a(batchName + '\n' + operator + '\n' + requestedFinalTargetAtStart + '\n' + (remainingTargetAtStart == null ? '' : remainingTargetAtStart) + '\n' + queue.join('\n'));
     var now = new Date().toISOString();
     var state = {
       schemaVersion: SCHEMA_VERSION,
@@ -987,6 +1532,13 @@
       status: 'idle',
       currentIndex: 0,
       targetQualified: targetQualified,
+      requestedFinalTargetAtStart: requestedFinalTargetAtStart,
+      remainingTargetAtStart: remainingTargetAtStart,
+      remainingTargetAfterBrowser: remainingTargetAtStart,
+      browserPassesThisBatch: 0,
+      targetControlVersion: remainingTargetAtStart === null ? '' : TARGET_CONTROL_VERSION,
+      stopAfterCurrentRowRequested: false,
+      stopAction: '',
       qualifiedCount: 0,
       rejectedCount: 0,
       historySkippedAsins: filtered.skipped,
@@ -998,6 +1550,7 @@
       createdAt: now,
       updatedAt: now
     };
+    clearGranularSidecar(hash);
     saveBatch(state);
     setPanelMessage('已生成 ' + queue.length + ' 个 ASIN；历史严格合格直接跳过 ' + filtered.skipped.length + ' 个。');
   }
@@ -1011,26 +1564,43 @@
     state.status = 'done';
     state.currentStep = 'done';
     state.stoppedReason = reason;
+    state.stopReason = reason;
+    state.stopAction = state.stopAction || reason;
     state.message = message;
     saveBatch(state);
   }
 
   function navigateToRow(state, index) {
-    var summary = summarizeResults(state.results);
-    var targetQualified = state.targetQualified || 20;
-    if (summary.qualified >= targetQualified) {
-      finishBatch(state, 'target_reached', 'Target reached: ' + summary.qualified + '/' + targetQualified + ' qualified.');
+    var latestState = loadBatch(state.queueHash);
+    if (latestState) state = latestState;
+    var decision = stopDecision(state);
+    if (decision.stop) {
+      var targetLabel = decision.control && decision.control.effectiveStopBudget != null
+        ? decision.control.effectiveStopBudget
+        : state.targetQualified || 20;
+      finishBatch(
+        state,
+        decision.reason,
+        decision.reason === 'operator_stop_after_current_row'
+          ? 'Current row saved; operator stop requested.'
+          : 'Target control stopped batch: ' + decision.passes + '/' + targetLabel + ' browser passes.'
+      );
+      finalizeActiveGranular(decision.reason, null);
       return;
     }
     if (index >= state.queue.length) {
-      finishBatch(state, 'queue_exhausted', 'Queue exhausted: ' + summary.qualified + '/' + targetQualified + ' qualified.');
+      finishBatch(state, 'queue_exhausted', 'Queue exhausted: ' + decision.passes + '/' + (decision.control.effectiveStopBudget || state.targetQualified || 20) + ' browser passes.');
+      finalizeActiveGranular('queue_exhausted', null);
       return;
     }
     state.currentIndex = index;
     state.currentStep = 'navigate';
     state.message = 'Opening ' + state.queue[index];
-    if (ENABLE_TIER0_TELEMETRY) state.currentNavigationStartedAtMs = Date.now();
+    var navigationIntentAtMs = Date.now();
+    if (ENABLE_TIER0_TELEMETRY) state.currentNavigationStartedAtMs = navigationIntentAtMs;
     saveBatch(state);
+    finalizeActiveGranular('', navigationIntentAtMs);
+    recordGranularNavigationIntent(state, index, navigationIntentAtMs);
     var url = new URL('https://www.amazon.com/dp/' + state.queue[index]);
     url.searchParams.set('th', '1');
     url.searchParams.set(AUTO_PARAM, '1');
@@ -1045,6 +1615,9 @@
     var index = firstMissingIndex(state);
     state.status = 'running';
     state.currentIndex = index;
+    state.stopAfterCurrentRowRequested = false;
+    state.stopAction = '';
+    state.stoppedReason = '';
     saveBatch(state);
     navigateToRow(state, index);
   }
@@ -1052,20 +1625,60 @@
   function pauseSelectedBatch() {
     var state = loadBatch(selectedHash());
     if (!state) return;
+    var statusBefore = state.status;
+    var stepBefore = state.currentStep;
     state.status = 'paused';
     state.currentStep = 'paused';
+    state.pausedFromStatus = statusBefore;
+    state.pausedFromStep = stepBefore;
     state.message = 'Pause requested; current row will be saved.';
+    state.pauseId = 'pause-' + Date.now();
+    state.pausedAtMs = Date.now();
+    recordControlEvent(state, 'pause_requested', {
+      statusBefore: statusBefore,
+      stepBefore: stepBefore,
+      pauseId: state.pauseId
+    });
     saveBatch(state);
   }
 
   function resumeSelectedBatch() {
     var state = loadBatch(selectedHash());
     if (!state) return;
+    var statusBefore = state.status;
+    var pauseDurationMs = Number.isFinite(Number(state.pausedAtMs))
+      ? Math.max(0, Date.now() - Number(state.pausedAtMs))
+      : null;
     var index = firstMissingIndex(state);
     state.status = 'running';
     state.currentIndex = index;
+    state.stopAfterCurrentRowRequested = false;
+    state.stopAction = '';
+    state.stoppedReason = '';
+    state.pendingPauseRecoveryMs = pauseDurationMs;
+    state.pausedFromStatus = '';
+    state.pausedFromStep = '';
+    recordControlEvent(state, 'resume_requested', {
+      statusBefore: statusBefore,
+      pauseId: state.pauseId || '',
+      pauseDurationMs: pauseDurationMs
+    });
     saveBatch(state);
     navigateToRow(state, index);
+  }
+
+  function stopAfterCurrentRowSelectedBatch() {
+    var state = loadBatch(selectedHash());
+    if (!state) return;
+    var rowInFlight = isCurrentAutoRowInFlight(state);
+    requestStopAfterCurrentRow(state, 'operator_stop_after_current_row');
+    recordControlEvent(state, 'stop_after_current_row_requested', {
+      reason: 'operator_stop_after_current_row'
+    });
+    saveBatch(state);
+    if (state.status !== 'running' && !rowInFlight) {
+      finishBatch(state, 'operator_stop_after_current_row', 'Stop requested; no row was in flight.');
+    }
   }
 
   async function copySelected(enrichment) {
@@ -1090,11 +1703,37 @@
     setPanelMessage((isGate ? 'Gate' : 'Timing') + ' telemetry TSV copied.');
   }
 
+  async function copyGranularTelemetry(kind) {
+    var state = loadBatch(selectedHash());
+    if (!state) return setPanelMessage('No batch available for granular telemetry export.');
+    var sidecar = readJson(granularKey(state.queueHash), null);
+    if (!sidecar
+        || sidecar.schemaVersion !== GRANULAR_TELEMETRY_SCHEMA_VERSION
+        || sidecar.queueHash !== state.queueHash
+        || (sidecar.batchCreatedAt || '') !== (state.createdAt || '')) {
+      return setPanelMessage('Granular telemetry sidecar missing; no values were inferred.');
+    }
+    var value;
+    var text;
+    if (kind === 'json') {
+      text = JSON.stringify(sidecar, null, 2);
+    } else if (kind === 'control') {
+      text = rowsToTsv(controlEventRows(sidecar), CONTROL_EVENT_COLUMNS);
+    } else {
+      text = rowsToTsv(granularTimingRows(sidecar), GRANULAR_TIMING_COLUMNS);
+    }
+    value = text;
+    await copyText(value);
+    document.querySelector('#ss-v3-output').value = value;
+    setPanelMessage('Granular ' + kind + ' telemetry copied.');
+  }
+
   function clearSelectedBatch() {
     var hash = selectedHash();
     if (!hash) return;
     if (!window.confirm('Clear selected Integrated Runner batch?')) return;
     localStorage.removeItem(stateKey(hash));
+    clearGranularSidecar(hash);
     writeJson(INDEX_KEY, getBatchIndex().filter(function (item) { return item.queueHash !== hash; }));
     localStorage.removeItem(SELECTED_KEY);
     renderPanel();
@@ -1203,47 +1842,114 @@
     return buildPriceTrend(samples);
   }
 
-  async function runCollectorOnce() {
-    await waitFor(function () { return document.querySelector('#ss-collector-run'); }, 18000, 250);
-    clickExactText('流量洞察');
-    await waitFor(function () {
-      var box = document.querySelector('.echarts-trends-box');
-      return box && visible(box) ? box : null;
-    }, 15000, 250);
-    var panel = document.querySelector('#ss-collector-panel');
-    var button = document.querySelector('#ss-collector-run');
-    var output = document.querySelector('#ss-collector-json');
-    if (!panel
-      || panel.getAttribute('data-ss-protocol-version') !== COLLECTOR_PROTOCOL_VERSION
-      || panel.getAttribute('data-ss-schema-version') !== COLLECTOR_SCHEMA_VERSION) {
-      throw new Error('Traffic Collector protocol mismatch; install Collector 0.4.6 or newer.');
+  async function runCollectorOnce(granularRow, attemptNumber) {
+    var attempt = {
+      attempt: attemptNumber,
+      handshakeMode: 'dom_run_id_v1_observed',
+      buttonWaitStartedAtMs: Date.now(),
+      buttonObservedAtMs: null,
+      trafficTabClickAtMs: null,
+      trafficTabClickFound: null,
+      chartWaitStartedAtMs: null,
+      chartReadyAtMs: null,
+      collectorClickAtMs: null,
+      collectingObservedAtMs: null,
+      completedObservedAtMs: null,
+      jsonParsedAtMs: null,
+      collectorRunId: '',
+      resultRunId: '',
+      resultReadyAttr: '',
+      runningAttr: '',
+      startAckMs: null,
+      resultWaitMs: null,
+      totalObservedMs: null,
+      collectorInternalChartWaitMs: null,
+      collectorTooltipScanMs: null,
+      collectorInternalTotalMs: null,
+      payloadStatus: '',
+      outcome: '',
+      reason: ''
+    };
+    try {
+      await waitFor(function () { return document.querySelector('#ss-collector-run'); }, 18000, 250);
+      attempt.buttonObservedAtMs = Date.now();
+      attempt.trafficTabClickAtMs = Date.now();
+      attempt.trafficTabClickFound = clickExactText('流量洞察');
+      attempt.chartWaitStartedAtMs = Date.now();
+      await waitFor(function () {
+        var box = document.querySelector('.echarts-trends-box');
+        return box && visible(box) ? box : null;
+      }, 15000, 250);
+      attempt.chartReadyAtMs = Date.now();
+      var button = document.querySelector('#ss-collector-run');
+      var output = document.querySelector('#ss-collector-json');
+      var collectorPanel = document.querySelector('#ss-collector-panel');
+      if (!collectorPanel
+        || collectorPanel.getAttribute('data-ss-protocol-version') !== COLLECTOR_PROTOCOL_VERSION
+        || collectorPanel.getAttribute('data-ss-schema-version') !== COLLECTOR_SCHEMA_VERSION) {
+        throw new Error('Traffic Collector protocol mismatch; install Collector 0.4.6 or newer.');
+      }
+      await waitFor(function () {
+        return collectorPanel.getAttribute('data-ss-running') !== '1';
+      }, 95000, 250);
+      var previousRunId = collectorPanel.getAttribute('data-ss-run-id') || '';
+      attempt.collectorClickAtMs = Date.now();
+      button.click();
+      var runId = await waitFor(function () {
+        var currentRunId = collectorPanel.getAttribute('data-ss-run-id') || '';
+        return currentRunId && currentRunId !== previousRunId ? currentRunId : null;
+      }, 5000, 50);
+      attempt.collectingObservedAtMs = Date.now();
+      attempt.collectorRunId = runId;
+      await waitFor(function () {
+        return collectorPanel.getAttribute('data-ss-result-ready') === '1'
+          && collectorPanel.getAttribute('data-ss-result-run-id') === runId;
+      }, 95000, 250);
+      attempt.completedObservedAtMs = Date.now();
+      var payload = JSON.parse(output.value || '{}');
+      attempt.jsonParsedAtMs = Date.now();
+      attempt.resultRunId = collectorPanel.getAttribute('data-ss-result-run-id') || '';
+      attempt.resultReadyAttr = collectorPanel.getAttribute('data-ss-result-ready') || '';
+      attempt.runningAttr = collectorPanel.getAttribute('data-ss-running') || '';
+      attempt.startAckMs = attempt.collectingObservedAtMs - attempt.collectorClickAtMs;
+      attempt.resultWaitMs = attempt.completedObservedAtMs - attempt.collectingObservedAtMs;
+      attempt.totalObservedMs = attempt.jsonParsedAtMs - attempt.collectorClickAtMs;
+      if (payload.runId !== runId) throw new Error('Traffic Collector returned a stale run result.');
+      if (payload.schemaVersion !== COLLECTOR_SCHEMA_VERSION) throw new Error('Traffic Collector schema mismatch.');
+      var internal = payload && payload.telemetry && payload.telemetry.timing ? payload.telemetry.timing : {};
+      attempt.collectorInternalChartWaitMs = Number.isFinite(Number(internal.chartWaitMs)) ? Number(internal.chartWaitMs) : null;
+      attempt.collectorTooltipScanMs = Number.isFinite(Number(internal.tooltipScanMs)) ? Number(internal.tooltipScanMs) : null;
+      attempt.collectorInternalTotalMs = Number.isFinite(Number(internal.totalMs)) ? Number(internal.totalMs) : null;
+      attempt.payloadStatus = payload.status || '';
+      attempt.outcome = 'payload';
+      return payload;
+    } catch (error) {
+      attempt.outcome = 'error';
+      attempt.reason = oneLine(error && error.message ? error.message : error);
+      throw error;
+    } finally {
+      if (granularRow) {
+        granularRow.collectorAttempts.push(attempt);
+        granularRow.sellerSprite.collectorButtonObservedAtMs = granularRow.sellerSprite.collectorButtonObservedAtMs || attempt.buttonObservedAtMs;
+        granularRow.sellerSprite.sellerSpriteUiFirstObservedAtMs = granularRow.sellerSprite.sellerSpriteUiFirstObservedAtMs || attempt.buttonObservedAtMs;
+        granularRow.sellerSprite.trafficTabClickAtMs = granularRow.sellerSprite.trafficTabClickAtMs || attempt.trafficTabClickAtMs;
+        granularRow.sellerSprite.trafficTabClickFound = attempt.trafficTabClickFound;
+        granularRow.sellerSprite.trafficChartReadyAtMs = granularRow.sellerSprite.trafficChartReadyAtMs || attempt.chartReadyAtMs;
+        granularRow.sellerSprite.trafficTabToChartReadyMs = attempt.chartReadyAtMs !== null && attempt.trafficTabClickAtMs !== null
+          ? Math.max(0, attempt.chartReadyAtMs - attempt.trafficTabClickAtMs)
+          : null;
+        if (attempt.reason) granularRow.sellerSprite.reason = attempt.reason;
+      }
     }
-    await waitFor(function () {
-      return panel.getAttribute('data-ss-running') !== '1';
-    }, 95000, 250);
-    var previousRunId = panel.getAttribute('data-ss-run-id') || '';
-    button.click();
-    var runId = await waitFor(function () {
-      var currentRunId = panel.getAttribute('data-ss-run-id') || '';
-      return currentRunId && currentRunId !== previousRunId ? currentRunId : null;
-    }, 5000, 50);
-    await waitFor(function () {
-      return panel.getAttribute('data-ss-result-ready') === '1'
-        && panel.getAttribute('data-ss-result-run-id') === runId;
-    }, 95000, 250);
-    var payload = JSON.parse(output.value || '{}');
-    if (payload.runId !== runId) throw new Error('Traffic Collector returned a stale run result.');
-    if (payload.schemaVersion !== COLLECTOR_SCHEMA_VERSION) throw new Error('Traffic Collector schema mismatch.');
-    return payload;
   }
 
-  async function collectTraffic(telemetry) {
+  async function collectTraffic(telemetry, granularRow) {
     if (telemetry) {
       telemetry.retryCount = 0;
       telemetry.retryDecision = 'no_retry';
       telemetry.retryReason = '';
     }
-    var payload = await runCollectorOnce();
+    var payload = await runCollectorOnce(granularRow, 1);
     var retryReason = ENABLE_TIER2_2_CONDITIONAL_RETRY
       ? collectorRetryReason(payload)
       : legacyCollectorRetryReason(payload);
@@ -1255,7 +1961,7 @@
     if (shouldRetry) {
       if (telemetry) telemetry.retryCount += 1;
       await sleep(600);
-      var retry = await runCollectorOnce();
+      var retry = await runCollectorOnce(granularRow, 2);
       if (retry.status === 'ok' && Number(retry.weeksRead || 0) >= Number(payload.weeksRead || 0)) payload = retry;
     }
     return payload;
@@ -1263,9 +1969,10 @@
 
   function updateCurrentStep(state, step, message) {
     var latest = loadBatch(state.queueHash);
-    if (!applyStepUpdate(latest, step, message)) return false;
-    saveBatch(latest);
-    Object.assign(state, latest);
+    if (!latest) return false;
+    mergeLatestControlState(state, latest);
+    if (!applyStepUpdate(state, step, message)) return false;
+    saveBatch(state);
     return true;
   }
 
@@ -1281,6 +1988,18 @@
     var actualAsin = currentAsin();
     var mismatch = Boolean(actualAsin && targetAsin !== actualAsin);
     var processStartedMs = Date.now();
+    var previousStep = state.currentStep || '';
+    var granularRow = beginGranularRow(state, index, processStartedMs);
+    if (!state.results[index] && ['traffic', 'dimensions', 'price'].indexOf(previousStep) >= 0) {
+      recordControlEvent(state, 'recovery_detected', {
+        row: index + 1,
+        asin: targetAsin,
+        stepBefore: previousStep,
+        recoveryKind: 'reload_with_unfinished_row',
+        recoveryEvidence: 'saved_step_' + previousStep + '_result_missing'
+      });
+    }
+    state.pendingPauseRecoveryMs = null;
     var startedAt = new Date().toISOString();
     var navigationStartedAtMs = Number(state.currentNavigationStartedAtMs);
     var detailPageMs = ENABLE_TIER0_TELEMETRY && Number.isFinite(navigationStartedAtMs)
@@ -1302,7 +2021,7 @@
         updateCurrentStep(state, 'traffic', 'Running Traffic Collector 0.4.6.');
         var trafficStartedMs = ENABLE_TIER0_TELEMETRY ? Date.now() : null;
         try {
-          collectorPayload = await collectTraffic(ENABLE_TIER0_TELEMETRY ? trafficTiming : null);
+          collectorPayload = await collectTraffic(ENABLE_TIER0_TELEMETRY ? trafficTiming : null, granularRow);
         } finally {
           if (ENABLE_TIER0_TELEMETRY) trafficChartMs = Date.now() - trafficStartedMs;
         }
@@ -1369,6 +2088,10 @@
       skippedSteps: skippedSteps,
       error: errorMessage
     }, traffic, dimensions, priceTrend);
+    if (granularRow) {
+      granularRow.collectorVersion = result.collectorVersion || '';
+      granularRow.completion.resultFinishedAtMs = Date.parse(result.finishedAt);
+    }
     if (ENABLE_TIER0_TELEMETRY) {
       var timingMeasurements = {
         detailPageMs: detailPageMs,
@@ -1405,14 +2128,34 @@
     state.message = targetAsin + ' ' + strictDecision + ' at ' + (strictDecision === 'pass' ? 'all_gates' : finalGate.stage) + ' in ' + Math.round((Date.now() - Date.parse(startedAt)) / 1000) + 's.';
     saveBatch(state);
 
-    if (state.status === 'paused') return;
-    var summary = summarizeResults(state.results);
-    if (summary.qualified >= (state.targetQualified || 20)) {
-      finishBatch(state, 'target_reached', 'Target reached: ' + summary.qualified + '/' + state.targetQualified + ' qualified.');
+    state = loadBatch(hash) || state;
+    var decision = stopDecision(state);
+    if (decision.stop && decision.reason === 'operator_stop_after_current_row') {
+      state.stopAction = decision.action;
+      finishBatch(state, decision.reason, 'Current row saved; operator stop requested.');
+      finalizeActiveGranular(decision.reason, null);
+      return;
+    }
+    if (state.status === 'paused') {
+      recordControlEvent(state, 'paused_after_row', { row: index + 1, asin: targetAsin });
+      finalizeActiveGranular('paused_after_row', null);
+      return;
+    }
+    if (decision.stop) {
+      state.stopAction = decision.action;
+      finishBatch(
+        state,
+        decision.reason,
+        decision.reason === 'operator_stop_after_current_row'
+          ? 'Current row saved; operator stop requested.'
+          : 'Target reached: ' + decision.passes + '/' + decision.control.effectiveStopBudget + ' browser passes.'
+      );
+      finalizeActiveGranular(decision.reason, null);
       return;
     }
     if (state.currentIndex >= state.queue.length) {
-      finishBatch(state, 'queue_exhausted', 'Queue exhausted: ' + summary.qualified + '/' + (state.targetQualified || 20) + ' qualified.');
+      finishBatch(state, 'queue_exhausted', 'Queue exhausted: ' + decision.passes + '/' + decision.control.effectiveStopBudget + ' browser passes.');
+      finalizeActiveGranular('queue_exhausted', null);
       return;
     }
     await sleep(500);
@@ -1424,6 +2167,13 @@
   createPanel();
   setTimeout(function () {
     processAutoRow().catch(function (error) {
+      var failedState = loadBatch(selectedHash());
+      if (failedState) {
+        recordControlEvent(failedState, 'auto_error', {
+          reason: oneLine(error && error.message ? error.message : error)
+        });
+      }
+      finalizeActiveGranular('auto_error', null);
       setPanelMessage('Auto error: ' + oneLine(error && error.message ? error.message : error));
     });
   }, 400);

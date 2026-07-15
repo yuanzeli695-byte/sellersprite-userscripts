@@ -3,20 +3,22 @@
 ## Public Repository Pair
 
 - Collector: `scripts/sellersprite-traffic-collector.user.js`, version 0.4.6.
-- Integrated Runner: `scripts/sellersprite-integrated-runner.user.js`, version 0.3.7.
+- Integrated Runner: `scripts/sellersprite-integrated-runner.user.js`, version 0.3.8.
 - Protocol: `1`.
 - Collector Schema: `sellerSpriteTraffic/v1`.
 
-A compatible external full-workflow project may retain versioned filenames such as `sellersprite_traffic_collector_v0.4.6.user.js` and `sellersprite_integrated_runner_v0.3.7.user.js`. Verify the metadata version and feature flag rather than assuming a filename proves compatibility.
+A compatible external full-workflow project may retain versioned filenames such as `sellersprite_traffic_collector_v0.4.6.user.js` and `sellersprite_integrated_runner_v0.3.8.user.js`. Verify the metadata version and feature flags rather than assuming a filename proves compatibility.
 
 Feature flags:
 
 - `ENABLE_TIER2_1_ZERO_SHARE_DERIVATION` controls guarded 0% derivation.
+- `ENABLE_TIER0_GRANULAR_TELEMETRY` controls the isolated granular timing sidecar.
+- `ENABLE_P1_CUMULATIVE_TARGET_CONTROL` controls remaining-target and stop-after-current-row behavior.
 - `ENABLE_TIER2_2_CONDITIONAL_RETRY` controls readiness-only retry.
 
 The approved Runner retries at most once and only for explicit chart or tooltip readiness failures. Known low traffic, partial valid samples, ordinary exceptions, and ambiguous data do not qualify for retry.
 
-Use Git history or a documented release artifact for rollback. The public Skill does not assume older rollback scripts exist in the working tree.
+Use Runner 0.3.7 with Collector 0.4.6, Git history, or a documented release artifact for rollback. The public Skill does not assume older rollback scripts exist in the working tree.
 
 ## Installation And Repository Validation
 
@@ -46,12 +48,13 @@ Set:
 
 - `batchName`: unique and traceable to the run/date, without sensitive data;
 - `operator`: blank or a non-sensitive internal label;
-- `targetQualified`: final strict-qualified target;
+- `targetQualified`: original final strict-qualified target;
+- `remainingTargetAtStart`: optional browser stop budget computed from the latest offline replay;
 - queue: one ASIN per line after history and local prefiltering.
 
 After `Generate`, confirm the queue hash and counts. After `Start`, watch current ASIN, gate, rejected count, qualified count, retry status, and messages. Stop on CAPTCHA, login expiry, duplicate panels, an unexpected redirect, or parser errors.
 
-At `done`, export combined JSON, enrichment JSON when present, gate TSV, and timing TSV before clearing anything.
+At `done`, export combined JSON, enrichment JSON when present, gate/timing TSV, granular JSON/TSV, and control-event TSV before clearing anything.
 
 ## Live Deployment Smoke
 

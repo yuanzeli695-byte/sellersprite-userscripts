@@ -1,5 +1,14 @@
 # Changelog
 
+## Integrated Runner 0.3.8
+
+- Added cumulative target control through `remainingTargetAtStart` without changing the original final target or granting offline acceptance.
+- Added `Stop after current row`, including pause/stop state merging so an in-flight row is saved before the batch closes.
+- Added isolated granular timing and control-event sidecars; legacy gate/timing TSV and strict-history behavior remain compatible.
+- Added the standard-library offline timing analyzer and fail-closed tests for timing/gate TSV pairing.
+- Preserved the public build's stable ScriptCat metadata, empty bootstrap history, safe DOM construction, sanitized result URLs, and Collector protocol/schema/run-id validation.
+- Rollback remains Runner `0.3.7` with Collector `0.4.6`.
+
 ## Codex Skill: amazon-us-strict-selection
 
 - Added an installable `skills/amazon-us-strict-selection` package with UI metadata, fail-closed operating rules, browser guidance, workbook acceptance guidance, and engineering governance.

@@ -30,6 +30,7 @@ Export and save:
 - enrichment JSON when applicable;
 - gate log TSV;
 - timing log TSV.
+- granular timing JSON/TSV and control-event TSV when Runner 0.3.8 telemetry is enabled.
 
 Do not run a formal US batch with Amazon set to a non-US delivery location.
 

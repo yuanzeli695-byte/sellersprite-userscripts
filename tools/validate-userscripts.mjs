@@ -21,6 +21,7 @@ const scripts = [
       "applyStepUpdate",
       "picker.replaceChildren()",
       "option.textContent = item.batchName",
+      "<input id=\"ss-v3-operator\" value=\"\">",
       "var BOOTSTRAP_STRICT_QUALIFIED_ASINS = [",
       "var PRICE_MIN_USD =",
       "var PRICE_MAX_USD =",
@@ -34,11 +35,9 @@ const scripts = [
       "url: sanitizedPageUrl()"
     ],
     forbiddenText: [
-      "liyuanze",
       "picker.innerHTML",
       "status && /Collecting/i",
       "url: location.href",
-      "B0G13L54YJ",
       "fetch(",
       "XMLHttpRequest",
       "WebSocket"

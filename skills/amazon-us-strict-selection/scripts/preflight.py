@@ -54,35 +54,43 @@ PIPELINE_TOP_LEVEL_KEYS = {
 APPROVED_SCRIPTS: dict[str, dict[str, Any]] = {
     "collector": {
         "version": "0.4.6",
-        "flag": "ENABLE_TIER2_1_ZERO_SHARE_DERIVATION",
+        "flags": ["ENABLE_TIER2_1_ZERO_SHARE_DERIVATION"],
         "candidates": [
             "scripts/sellersprite-traffic-collector.user.js",
             "scripts/sellersprite_traffic_collector_v0.4.6.user.js",
         ],
     },
     "runner": {
-        "version": "0.3.7",
-        "flag": "ENABLE_TIER2_2_CONDITIONAL_RETRY",
+        "version": "0.3.8",
+        "flags": [
+            "ENABLE_TIER0_GRANULAR_TELEMETRY",
+            "ENABLE_P1_CUMULATIVE_TARGET_CONTROL",
+            "ENABLE_TIER2_2_CONDITIONAL_RETRY",
+        ],
         "candidates": [
             "scripts/sellersprite-integrated-runner.user.js",
-            "scripts/sellersprite_integrated_runner_v0.3.7.user.js",
+            "scripts/sellersprite_integrated_runner_v0.3.8.user.js",
         ],
     },
 }
 
 OPTIONAL_ROLLBACK_SCRIPTS = {
     "collector": "scripts/sellersprite_traffic_collector_v0.4.5.user.js",
-    "runner": "scripts/sellersprite_integrated_runner_v0.3.6.user.js",
+    "runner": "scripts/sellersprite_integrated_runner_v0.3.7.user.js",
 }
 
 USERSCRIPT_REPO_REQUIRED_FILES = [
     "README.md",
     "docs/CONFIGURATION.md",
+    "docs/P1_TARGET_CONTROL_AND_GRANULAR_TELEMETRY.md",
     "package.json",
+    "scripts/analyze_timing.py",
     "scripts/sellersprite-traffic-collector.user.js",
     "scripts/sellersprite-integrated-runner.user.js",
     "tools/validate-userscripts.mjs",
     "tools/core-logic.test.mjs",
+    "tools/runner-p1.test.mjs",
+    "tests/test_analyze_timing.py",
 ]
 
 FULL_PROJECT_REQUIRED_FILES = [
@@ -98,12 +106,14 @@ FULL_PROJECT_REQUIRED_FILES = [
     "scripts/replay_existing_batch.py",
     "scripts/build_replay_workbooks.mjs",
     "scripts/acceptance_checker.py",
+    "scripts/analyze_timing.py",
     "scripts/filter_engine.py",
     "scripts/qualified_pool_manager.py",
     "scripts/state_store.py",
     "scripts/strict_history.py",
     "tests/test_sellersprite_traffic_collector_v046.mjs",
-    "tests/test_sellersprite_integrated_runner_v037.mjs",
+    "tests/test_sellersprite_integrated_runner_v038.mjs",
+    "tests/test_analyze_timing.py",
 ]
 
 RUN_FILES = [
@@ -311,15 +321,17 @@ def main() -> int:
     for role, definition in APPROVED_SCRIPTS.items():
         path, relative = find_script(root, definition["candidates"])
         actual_version = userscript_version(path) if path else None
-        flag_enabled = bool(path and userscript_flag_enabled(path, definition["flag"]))
-        role_ok = actual_version == definition["version"] and flag_enabled
+        flag_status = {
+            flag: bool(path and userscript_flag_enabled(path, flag))
+            for flag in definition["flags"]
+        }
+        role_ok = actual_version == definition["version"] and all(flag_status.values())
         script_report[role] = {
             "path": str(path) if path else None,
             "relativePath": relative,
             "expectedVersion": definition["version"],
             "actualVersion": actual_version,
-            "requiredFlag": definition["flag"],
-            "requiredFlagEnabled": flag_enabled,
+            "requiredFlags": flag_status,
             "ok": role_ok,
         }
         if not path:
@@ -328,8 +340,9 @@ def main() -> int:
             errors.append(
                 f"{role} version mismatch: expected {definition['version']}, got {actual_version}"
             )
-        if path and not flag_enabled:
-            errors.append(f"{role} approved feature flag is not enabled: {definition['flag']}")
+        for flag, enabled in flag_status.items():
+            if path and not enabled:
+                errors.append(f"{role} approved feature flag is not enabled: {flag}")
 
     parsed_json: dict[str, Any] = {}
     rule_drift: list[dict[str, Any]] = []

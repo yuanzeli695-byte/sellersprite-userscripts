@@ -41,7 +41,7 @@ Documented baseline:
 - Tier 0 complete.
 - Tier 1.1 procedure and Tier 1.2 reorder-only ranking complete.
 - Tier 1.3 proxy-field implementation is not authorized without real source fields.
-- Tier 2.1 guarded-zero parsing and Tier 2.2 conditional retry are represented by Collector 0.4.6 and Runner 0.3.7.
+- Tier 2.1 guarded-zero parsing and Tier 2.2 conditional retry are represented by Collector 0.4.6; Runner 0.3.8 adds the approved P1 target controls and isolated granular telemetry without changing hard-gate functions.
 - Tier 2.3 preloading is paused.
 - Do not begin later Tiers merely because earlier code exists.
 

@@ -83,7 +83,7 @@ For every formal full-mode run, preserve at least:
 - candidate source files and normalization report;
 - selected queue plus prefilter rejection audit;
 - downloaded image files and image report;
-- Runner combined batch JSON plus gate and timing logs;
+- Runner combined batch JSON plus gate, timing, granular, and control-event logs;
 - run summary, final-candidate data, and rejected-audit data;
 - final workbook, rejected-audit workbook, previews, build report, and acceptance report;
 - implementation or deployment handoff when code or userscript versions changed.

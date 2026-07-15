@@ -8,9 +8,12 @@
     "url": "https://github.com/yuanzeli695-byte/sellersprite-userscripts.git"
   },
   "scripts": {
-    "test": "npm run test:userscripts && npm run test:skill",
+    "test": "npm run test:userscripts && npm run test:runner-p1 && npm run test:skill && npm run test:python",
     "test:userscripts": "node tools/validate-userscripts.mjs && node tools/core-logic.test.mjs",
+    "test:runner-p1": "node tools/runner-p1.test.mjs",
     "test:skill": "node tools/validate-skill.mjs",
+    "test:python": "python -m unittest discover -s tests -p \"test_*.py\" -v",
+    "analyze:timing": "python scripts/analyze_timing.py",
     "version:integrated": "node tools/set-version.mjs integrated",
     "version:collector": "node tools/set-version.mjs collector"
   },
